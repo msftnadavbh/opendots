@@ -26,7 +26,17 @@ import { recordDeployment, validateVmState, verifyVm } from './vm-state.mjs';
 import { validateParameters } from './ssh.mjs';
 import { provisionVm, configureVm, vmServiceCommand } from './vm.mjs';
 import { managedTransport } from './run-command.mjs';
-import { recoverInitialActivation } from './initial-activation.mjs';
+import {
+  assertNormalActivation,
+  inspectInitialGuest,
+  inspectCaddy,
+  recoverInitialActivation,
+} from './initial-activation.mjs';
+import {
+  reconcileExistingPilot,
+  verifyExistingPilot,
+  existingPilotSave,
+} from './existing-pilot.mjs';
 import { backupHttps } from './backup-https.mjs';
 import { readPrivate, writePrivate } from './runtime-env.mjs';
 import { stageBuild } from './build-context.mjs';
@@ -65,10 +75,13 @@ export async function main(args = process.argv.slice(2)) {
     'management-reconcile': 0,
     'management-record-canary': 1,
     'recover-initial-image': 1,
+    'reconcile-existing': 0,
+    'initial-check': 0,
+    'caddy-check': 0,
   };
   if (!command || command === 'help') {
     console.log(
-      'VM pilot only: validate | what-if | deploy | build | provision <ARM-outputs.json> <registry/opendots@sha256:digest> | configure | status | backup | restore-test <backup.sqlite> | restart | stop | resume | token-disable | management-canary | management-reconcile | management-record-canary <private-proof.json> | recover-initial-image <private-reviewed-target.json>. SSH management is retired; backup uses owner-authenticated HTTPS. Historical prepare parameters/keys stay pinned.',
+      'VM pilot only: validate | what-if | deploy | build | provision <ARM-outputs.json> <registry/opendots@sha256:digest> | configure | status | backup | restore-test <backup.sqlite> | restart | stop | resume | token-disable | reconcile-existing | initial-check | caddy-check | management-canary | management-reconcile | management-record-canary <private-proof.json> | recover-initial-image <private-reviewed-target.json>. SSH management is retired; backup uses owner-authenticated HTTPS. Historical prepare parameters/keys stay pinned.',
     );
     return;
   }
@@ -195,9 +208,31 @@ export async function main(args = process.argv.slice(2)) {
         command === 'provision' ? resolve(parameters[0]) : outputsPath,
       ),
     );
-    await verifyLiveResources(az, output);
-    await inspectGroupBeforeDeployment(az, saved);
+    if (command === 'reconcile-existing') {
+      await reconcileExistingPilot(az, output, publicParameters, saved, save);
+      console.log(
+        'Existing original VM reconciliation recorded for the exact post-change web profile. No resource, binding, image or guest was changed.',
+      );
+      return;
+    }
+    let existing;
+    if (saved?.existingPilot !== undefined)
+      existing = await verifyExistingPilot(az, output, publicParameters, saved);
+    else {
+      await verifyLiveResources(az, output);
+      await inspectGroupBeforeDeployment(az, saved);
+    }
     if (command === 'build') {
+      if (existing)
+        requirePilot(
+          !existing.state.management?.pending &&
+            !existing.state.pullOperationId &&
+            !existing.state.initialActivationRecovery?.conflict &&
+            !['prepared', 'applied'].includes(
+              existing.state.initialActivationRecovery?.status,
+            ),
+          'Reconcile pending or conflicting existing-pilot work before a new build.',
+        );
       await mkdir('/tmp/opencode', { recursive: true, mode: 0o700 });
       const context = await mkdtemp('/tmp/opencode/opendots-pilot-build-');
       try {
@@ -254,7 +289,10 @@ export async function main(args = process.argv.slice(2)) {
       return;
     }
     validateVmState(saved, publicParameters);
-    let verified = await verifyVm(az, output, publicParameters, saved, save);
+    let verified =
+      existing ?? (await verifyVm(az, output, publicParameters, saved, save));
+    if (['provision', 'configure', 'restart', 'resume'].includes(command))
+      assertNormalActivation(verified.state, output);
     if (command === 'status' && verified.power !== 'PowerState/running') {
       console.log(
         JSON.stringify({
@@ -277,6 +315,10 @@ export async function main(args = process.argv.slice(2)) {
       ['PowerState/stopped', 'PowerState/deallocated'].includes(verified.power)
     ) {
       requirePilot(
+        !existing,
+        'Existing-pilot reconciliation grants no automatic power start; obtain separate live power authorization.',
+      );
+      requirePilot(
         !verified.state.initialActivationRecovery?.conflict,
         'Bound post-intent conflict prohibits automatic resume; retain recovery facts for lead reconciliation.',
       );
@@ -291,11 +333,13 @@ export async function main(args = process.argv.slice(2)) {
       );
     }
     requirePilot(
-      verified.power === 'PowerState/running',
+      command === 'management-reconcile' ||
+        verified.power === 'PowerState/running',
       'VM is not running. Explicitly resume it; SSH must remain closed.',
     );
     controller.signal.throwIfAborted();
     const state = verified.state;
+    const persist = existing ? existingPilotSave(state, save) : save;
     if (command === 'backup') {
       requirePilot(
         state.provisioned && state.configured,
@@ -315,7 +359,7 @@ export async function main(args = process.argv.slice(2)) {
     const ssh = managedTransport({
       az,
       state,
-      save,
+      save: persist,
       signal: controller.signal,
     });
     if (command === 'management-reconcile') {
@@ -348,7 +392,7 @@ export async function main(args = process.argv.slice(2)) {
         output,
         parameters: publicParameters,
         state,
-        save,
+        save: persist,
         approval: await jsonFile(resolve(parameters[0])),
       });
       console.log(
@@ -363,9 +407,41 @@ export async function main(args = process.argv.slice(2)) {
         ),
       'Reconcile initial activation recovery before normal guest operations; a bound conflict prohibits automatic continuation.',
     );
+    if (
+      command === 'initial-check' ||
+      (command === 'status' &&
+        existing &&
+        !state.provisioned &&
+        !state.configured)
+    ) {
+      await inspectInitialGuest({ ssh, state });
+      console.log(
+        JSON.stringify({
+          power: verified.power,
+          service: 'inactive',
+          initialGuestChecks: 'passed',
+          activated: false,
+        }),
+      );
+      return;
+    }
+    if (command === 'caddy-check') {
+      await inspectCaddy({ ssh, state });
+      console.log(
+        'Caddy fixed configuration, service-user readability and running service checks passed; no service/configuration was changed.',
+      );
+      return;
+    }
     if (command === 'provision') {
       controller.signal.throwIfAborted();
-      await provisionVm({ az, ssh, output, image: parameters[1], state, save });
+      await provisionVm({
+        az,
+        ssh,
+        output,
+        image: parameters[1],
+        state,
+        save: persist,
+      });
       // Imported outputs are stored only after scope and live ownership validation.
       await writePrivate(outputsPath, JSON.stringify(output, null, 2));
       console.log(
@@ -390,7 +466,7 @@ export async function main(args = process.argv.slice(2)) {
         state,
         sourcePath: join(root, '.env'),
         privatePath: join(root, '.env.pilot'),
-        save,
+        save: persist,
       });
       console.log(
         'Runtime configuration uploaded atomically. Owner token is only in .env.pilot (0600), never stdout.',

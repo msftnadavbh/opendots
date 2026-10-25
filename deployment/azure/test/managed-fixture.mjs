@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { SCOPE, RUN_COMMAND } from '../scope.mjs';
+import { SCOPE, RUN_COMMAND, VM } from '../scope.mjs';
 import {
   managedTransport,
   PRIVACY_CHECKS,
   TRANSPORT_SHA256,
 } from '../run-command.mjs';
-import { state as initial } from './fixtures.mjs';
+import { state as initial, vmResources } from './fixtures.mjs';
 
 export function handlerResource() {
   return {
@@ -19,7 +19,7 @@ export function handlerResource() {
       provisioningState: 'Succeeded',
       instanceView: {
         typeHandlerVersion: '1.3.0',
-        statuses: [{ code: 'ProvisioningState/succeeded' }],
+        statuses: [{ code: 'ProvisioningState/succeeded', level: 'Info' }],
       },
     },
   };
@@ -63,11 +63,47 @@ export function managedFixture(options = {}) {
     calls: [],
     controller: new AbortController(),
     handler: handlerResource(),
+    vm: vmResources().vm,
+    extensions: { value: [] },
     resource: undefined,
     result: undefined,
     imagePresent: false,
     putFailure: undefined,
     mutation: undefined,
+  };
+  f.vm.properties.instanceView = {
+    statuses: [
+      { code: 'ProvisioningState/succeeded' },
+      { code: 'PowerState/running' },
+    ],
+    vmAgent: {
+      vmAgentVersion: '2.16.0.2',
+      statuses: [
+        {
+          code: 'ProvisioningState/succeeded',
+          level: 'Info',
+          displayStatus: 'Ready',
+        },
+      ],
+    },
+  };
+  f.az = {
+    verify: async ({ signal, timeoutMs }) => {
+      assert.equal(timeoutMs, 30_000);
+      signal.throwIfAborted();
+      f.calls.push('readiness');
+    },
+    read: async (args, { signal, timeoutMs }) => {
+      assert.equal(timeoutMs, 30_000);
+      signal.throwIfAborted();
+      assert.deepEqual(args.slice(0, 4), ['rest', '--method', 'get', '--url']);
+      const endpoint = `https://management.azure.com${VM.ids.id}`;
+      if (args[4] === `${endpoint}?api-version=2025-11-01&$expand=instanceView`)
+        return structuredClone(f.vm);
+      assert.equal(args[4], `${endpoint}/extensions?api-version=2025-11-01`);
+      return structuredClone(f.extensions);
+    },
+    write: () => assert.fail('Fixture readiness must never write Azure'),
   };
   f.durable = structuredClone(f.state);
   f.complete = (exitCode = 0, category = 'ok') => {
@@ -126,13 +162,15 @@ export function managedFixture(options = {}) {
         name: RUN_COMMAND.name,
       };
       f.resource.properties.protectedParameters = [];
+      if (!f.extensions.value.includes(f.handler))
+        f.extensions.value.push(f.handler);
       f.complete();
       if (f.putFailure === 'after') throw new Error('private provider failure');
       await options.afterPut?.(f, signal);
     },
   };
   f.guest = managedTransport({
-    az: { verify: () => assert.fail('Fixture must never call Azure') },
+    az: f.az,
     state: f.state,
     save: f.save,
     client: f.client,

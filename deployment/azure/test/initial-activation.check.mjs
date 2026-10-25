@@ -9,6 +9,7 @@ import {
   INITIAL_UNIT_SHA256,
   initialActivationTarget,
   recoverInitialActivation,
+  assertNormalActivation,
 } from '../initial-activation.mjs';
 import { RUN_COMMAND, SCOPE, TAGS, PULL_ACTIONS } from '../scope.mjs';
 import {
@@ -21,6 +22,7 @@ import {
 } from './fixtures.mjs';
 import { managedFixture } from './managed-fixture.mjs';
 import { provisionVm } from '../vm.mjs';
+import { verifyVm } from '../vm-state.mjs';
 
 const execute = promisify(execFile);
 const target = initialActivationTarget(image);
@@ -724,4 +726,207 @@ test('a first guest conflict is not an applied receipt and blocks normal provisi
     source.indexOf('verified.state.initialActivationRecovery?.conflict') <
       source.indexOf("await az.write(['vm', 'start'"),
   );
+});
+
+async function benignIneligible(t, marker = 'provisioned') {
+  const f = localFixture(t);
+  f.state.image = image.replace(/a$/, 'b');
+  f.state[marker] = true;
+  await assert.rejects(f.run(), /permanently ineligible/);
+  assert.deepEqual(f.state.initialActivationRecovery, {
+    ...review,
+    status: 'ineligible',
+  });
+  assert.notEqual(f.state.image, f.state.initialActivationRecovery.newImage);
+  assert.equal(f.guestCalls.length, 0);
+  f.check = async () => {
+    const verified = await verifyVm(
+      f.az,
+      output,
+      parameters,
+      f.state,
+      async () => {},
+    );
+    assertNormalActivation(verified.state, output);
+  };
+  return f;
+}
+
+for (const marker of ['provisioned', 'configured'])
+  test(`actual pre-intent ineligible producer with ${marker} history permits strictly verified normal work, not another recovery`, async (t) => {
+    const f = await benignIneligible(t, marker);
+    const before = structuredClone(f.state);
+    await f.check();
+    assert.deepEqual(f.state, before);
+    assert.equal(f.saved.length, 1);
+    await assert.rejects(f.run(), /permanently ineligible/);
+    assert.deepEqual(f.state, before);
+    assert.equal(f.guestCalls.length, 0);
+  });
+
+for (const [name, mutate] of Object.entries({
+  'existing lane': (s) => {
+    s.existingPilot = {};
+  },
+  'null existing metadata is not absent': (s) => {
+    s.existingPilot = null;
+  },
+  'original image': (s) => {
+    s.image = INITIAL_IMAGE;
+  },
+  'no activation markers': (s) => {
+    s.provisioned = false;
+    s.configured = false;
+  },
+  'truthy but nonboolean activation': (s) => {
+    s.provisioned = 'true';
+  },
+  'invalid pinned image': (s) => {
+    s.image = 'foreign/image:latest';
+  },
+}))
+  test(`benign strict exception rejects ${name}`, async (t) => {
+    const f = await benignIneligible(t);
+    mutate(f.state);
+    const before = structuredClone(f.state);
+    await assert.rejects(f.check());
+    assert.deepEqual(f.state, before);
+    assert.equal(f.saved.length, 1);
+    assert.equal(f.guestCalls.length, 0);
+  });
+
+for (const field of [
+  'operationId',
+  'binding',
+  'fsUuid',
+  'diskOperationId',
+  'immutableStateSha256',
+  'reviewSha256',
+  'receipt',
+  'conflict',
+  'oldUnit',
+  'newUnit',
+  'unknown',
+])
+  for (const value of [null, false, undefined])
+    test(`pre-intent exception rejects extra ${field} even when ${String(value)}`, async (t) => {
+      const f = await benignIneligible(t);
+      f.state.initialActivationRecovery[field] = value;
+      await assert.rejects(f.check());
+      assert.equal(f.saved.length, 1);
+      assert.equal(f.guestCalls.length, 0);
+    });
+
+test('present null/malformed/unknown recovery records and bad target hashes never act like absence', async (t) => {
+  const f = await benignIneligible(t);
+  const benign = structuredClone(f.state.initialActivationRecovery);
+  for (const record of [
+    null,
+    undefined,
+    false,
+    '',
+    [],
+    {},
+    { ...benign, version: 2 },
+    { ...benign, oldImage: image },
+    { ...benign, newImage: INITIAL_IMAGE },
+    { ...benign, oldUnitSha256: '0'.repeat(64) },
+    { ...benign, newUnitSha256: '0'.repeat(64) },
+    { ...benign, status: 'prepared' },
+    { ...benign, status: 'applied' },
+    { ...benign, status: 'complete' },
+    { ...benign, status: 'unknown' },
+    { ...benign, receipt: { status: 'applied' } },
+    { ...benign, receipt: { status: 'ineligible' } },
+    { ...benign, conflict: { status: 'post-intent-conflict' } },
+  ]) {
+    f.state.initialActivationRecovery = record;
+    await assert.rejects(f.check());
+  }
+  delete f.state.initialActivationRecovery;
+  await f.check();
+  assert.equal(f.saved.length, 1);
+  assert.equal(f.guestCalls.length, 0);
+});
+
+for (const slot of ['pending', 'receipt'])
+  test(`contradictory recovery evidence in management.${slot} closes the benign exception`, async (t) => {
+    const f = await benignIneligible(t);
+    for (const operation of [
+      { schema: 'recovery' },
+      { schema: 'unknown' },
+      { ...review, status: 'applied' },
+      { schema: 'empty', recovery: null },
+      { schema: 'empty', recovery: false },
+      { schema: 'empty', conflict: false },
+      { schema: 'empty', status: false },
+      { schema: 'empty', oldUnitSha256: null },
+      { schema: 'empty', newUnitSha256: false },
+      { schema: 'empty', result: { status: 'applied' } },
+      { schema: 'empty', result: { status: 'ineligible' } },
+      { schema: 'empty', result: { status: 'post-intent-conflict' } },
+      { schema: 'empty', result: { oldUnitSha256: null } },
+      { schema: 'empty', result: { newUnitSha256: false } },
+    ]) {
+      f.state.management = { [slot]: operation };
+      await assert.rejects(f.check(), /contradictory recovery evidence/);
+    }
+    assert.equal(f.saved.length, 1);
+    assert.equal(f.guestCalls.length, 0);
+  });
+
+test('ordinary managed receipts remain compatible; unrelated pending still needs normal GET-only reconciliation', async (t) => {
+  const f = await benignIneligible(t);
+  const m = managedFixture({ state: f.state });
+  f.state = m.state;
+  const record = structuredClone(f.state.initialActivationRecovery);
+  await m.guest.run('true');
+  await f.check();
+  m.putFailure = 'after';
+  await assert.rejects(m.guest.run('true'));
+  await f.check();
+  await assert.rejects(m.guest.run('true'), /pending/);
+  assert.equal(m.requests.length, 2);
+  await m.guest.reconcile();
+  await f.check();
+  assert.deepEqual(f.state.initialActivationRecovery, record);
+});
+
+test('normal activation still requires a valid complete transaction, and fresh strict verification cannot be skipped by a benign record', async (t) => {
+  const f = localFixture(t);
+  await f.run();
+  const verified = await verifyVm(
+    f.az,
+    output,
+    parameters,
+    f.state,
+    async () => {},
+  );
+  assertNormalActivation(verified.state, output);
+  for (const patch of [
+    { status: 'prepared' },
+    { status: 'applied' },
+    { status: 'ineligible' },
+    { receipt: null },
+    { reviewSha256: '' },
+    { operationId: 'foreign' },
+    { conflict: { status: 'post-intent-conflict' } },
+  ]) {
+    assert.throws(() =>
+      assertNormalActivation(
+        {
+          ...verified.state,
+          initialActivationRecovery: {
+            ...verified.state.initialActivationRecovery,
+            ...patch,
+          },
+        },
+        output,
+      ),
+    );
+  }
+  const benign = await benignIneligible(t);
+  benign.resources.vm.identity.principalId = plan.operationId;
+  await assert.rejects(benign.check(), /Pinned/);
+  assert.equal(benign.guestCalls.length, 0);
 });

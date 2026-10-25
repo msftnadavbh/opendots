@@ -1,10 +1,12 @@
 """Execute the real recovery transaction against private files and mocked host commands only."""
 import hashlib
+import ast
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -12,12 +14,28 @@ import types
 
 root = Path(sys.argv[1])
 case = sys.argv[2]
+mode = 'recovery'
+if case.startswith(('check-initial:', 'check-caddy:')):
+    mode, case = case.split(':', 1)
 scenario = case
 plan = json.load(sys.stdin)
 source = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('recovery', source / 'initial-activation.py')
 recovery = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(recovery)
+if mode != 'recovery':
+    outer = shlex.split(plan['command'])
+    assert outer[:4] == ['sudo', '-n', '/bin/bash', '-c'] and len(outer) == 5
+    launch = shlex.split(outer[4].split('exec timeout --kill-after=10 180 /bin/bash -c ', 1)[1])
+    assert len(launch) == 1
+    python = shlex.split(launch[0])
+    assert python[:3] == ['/usr/bin/python3', '-B', '-c'] and len(python) == 4
+    tree = ast.parse(python[3])
+    invocation = tree.body.pop()
+    assert isinstance(invocation, ast.Expr) and isinstance(invocation.value, ast.Call)
+    assert invocation.value.func.id == ('check_initial' if mode == 'check-initial' else 'check_caddy')
+    recovery = types.ModuleType('actual_readonly_program')
+    exec(compile(tree, 'actual-readonly-program', 'exec'), recovery.__dict__)
 old, new = plan['oldUnit'].encode(), plan['newUnit'].encode()
 intent = {key: value for key, value in plan.items() if key not in ('oldUnit', 'newUnit')}
 base = root / 'etc/opendots/initial-activation-v1'
@@ -35,6 +53,25 @@ for name in recovery.HELPERS:
     target = root / 'usr/local/lib/opendots' / name
     shutil.copyfile(source / name, target)
     target.chmod(0o755)
+if mode != 'recovery':
+    for path, content in [
+        (unit.parent / 'srv-opendots.mount', plan['mount']),
+        (root / 'etc/opendots/Caddyfile', plan['caddy']),
+        (unit.parent / 'caddy.service.d/opendots.conf', plan['caddyService']),
+    ]:
+        path.parent.mkdir(mode=0o755, exist_ok=True)
+        path.write_text(content)
+        path.chmod(0o644)
+    if case == 'mount-missing':
+        (unit.parent / 'srv-opendots.mount').unlink()
+    elif case == 'mount-drift':
+        (unit.parent / 'srv-opendots.mount').write_text('foreign mount')
+    elif case == 'caddy-mode':
+        (root / 'etc/opendots/Caddyfile').chmod(0o600)
+    elif case == 'caddy-bytes':
+        (root / 'etc/opendots/Caddyfile').write_text('FAKE-PRIVATE-CADDY-CONTENT')
+    elif case == 'caddy-dropin-bytes':
+        (unit.parent / 'caddy.service.d/opendots.conf').write_text('foreign command')
 
 
 def private_file(name, content):
@@ -150,7 +187,7 @@ replaced = False
 published = ''
 
 
-def fixture_open(path, flags, mode=0o777, *, dir_fd=None):
+def fixture_open(path, flags, file_mode=0o777, *, dir_fd=None):
     if path == '/':
         path = str(root)
     else:
@@ -158,13 +195,16 @@ def fixture_open(path, flags, mode=0o777, *, dir_fd=None):
     target = Path(path) if dir_fd is None else fdpath(dir_fd) / path
     assert target.is_relative_to(root)
     if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
+        assert mode == 'recovery', 'Diagnostic attempted a filesystem write'
         assert target.is_relative_to(base) or target.parent == unit.parent
         event('write:' + str(target.relative_to(root)).split('/.')[0])
+    if mode != 'recovery':
+        assert target.name not in ('runtime.env', 'opendots.sqlite'), 'Diagnostic attempted to read private contents'
     if replaced and target == unit and not flags & os.O_WRONLY:
         event('unit-post-check')
     if target == base / 'applied.json' and target.exists():
         event('applied-post-check')
-    return os.open(path, flags, mode, dir_fd=dir_fd)
+    return os.open(path, flags, file_mode, dir_fd=dir_fd)
 
 
 def fixture_stat(fd):
@@ -234,6 +274,8 @@ unknown = []
 def host(args, **options):
     assert options['check'] is False and options['timeout'] == 45
     assert not any('format' in part or 'mkfs' in part or part in ('start', 'enable', 'stop', 'restart') for part in args)
+    if mode != 'recovery':
+        assert not any(part in ('mount', 'prepare', 'repair', 'pull', 'configure', 'daemon-reload', 'reload') for part in args)
     event('command:' + ' '.join(args[:3]))
     result = ''
     failure = False
@@ -281,6 +323,19 @@ def host(args, **options):
         if not failure:
             cache.write_bytes(unit.read_bytes())
         event('daemon-reload')
+    elif args == ['/usr/bin/sudo', '-n', '-u', 'caddy', '--', '/usr/bin/test', '-r', '/etc/opendots/Caddyfile']:
+        assert mode == 'check-caddy'
+        failure = case == 'caddy-unreadable'
+    elif args[:3] == ['/usr/bin/systemctl', 'show', 'caddy.service']:
+        assert mode == 'check-caddy'
+        value = dict(LoadState='loaded', ActiveState='active', SubState='running', User='caddy',
+                     DropInPaths='/etc/systemd/system/caddy.service.d/opendots.conf', Job='0', NeedDaemonReload='no')
+        changes = {'caddy-failed': {'ActiveState': 'failed'}, 'caddy-inactive': {'ActiveState': 'inactive'},
+                   'caddy-user': {'User': 'root'}, 'caddy-extra-dropin': {'DropInPaths': value['DropInPaths'] + ' /foreign.conf'},
+                   'caddy-job': {'Job': '123'}, 'caddy-reload': {'NeedDaemonReload': 'yes'}}
+        value.update(changes.get(case, {}))
+        result = '\n'.join(key + '=' + value[key] for key in value)
+        failure = case == 'caddy-show-error'
     else:
         unknown.append(args)
         raise AssertionError('Unexpected host command')
@@ -299,7 +354,14 @@ if case.startswith('crash-'):
     case = 'after-crash'
 
 try:
-    status = recovery.recover(plan)
+    if mode == 'recovery':
+        status = recovery.recover(plan)
+    else:
+        exec(compile(ast.Module(body=[invocation], type_ignores=[]), 'actual-readonly-invocation', 'exec'), recovery.__dict__)
+        status = 'passed'
+except recovery.Ineligible:
+    assert mode != 'recovery'
+    status = 'rejected'
 except RuntimeError:
     status = 'rejected'
 except OSError:

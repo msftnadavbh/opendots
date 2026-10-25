@@ -365,6 +365,7 @@ test('intent precedes PUT; successful receipt is durable before named resource r
   await f.guest.run('true');
   assert.deepEqual(f.calls, [
     'GET',
+    'readiness',
     'save-intent',
     'PUT',
     'GET',

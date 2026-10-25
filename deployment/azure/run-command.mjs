@@ -184,6 +184,162 @@ export function assertManagedHandler(resource, ready = false) {
   };
 }
 
+async function submissionReady(az, client, state, existing, signal) {
+  const options = { signal, timeoutMs: 30_000 };
+  signal.throwIfAborted();
+  await az.verify(options);
+  const endpoint = `https://management.azure.com${VM.ids.id}`;
+  const vmApi = '2025-11-01';
+  const vm = await az.read(
+    [
+      'rest',
+      '--method',
+      'get',
+      '--url',
+      `${endpoint}?api-version=${vmApi}&$expand=instanceView`,
+    ],
+    options,
+  );
+  assertOwned(vm, VM.ids.id);
+  const p = vm.properties,
+    view = p?.instanceView,
+    agent = view?.vmAgent;
+  const status = (items, prefix, expected) =>
+    Array.isArray(items) &&
+    items.filter((item) => item.code?.startsWith(prefix)).length === 1 &&
+    items.some((item) => item.code === expected);
+  requirePilot(
+    p?.vmId === state.binding.vmUniqueId &&
+      vm.identity?.type === 'SystemAssigned' &&
+      vm.identity.tenantId === state.binding.tenantId &&
+      vm.identity.principalId === state.binding.principalId &&
+      !Object.keys(vm.identity.userAssignedIdentities ?? {}).length &&
+      p.osProfile?.linuxConfiguration?.provisionVMAgent === true &&
+      p.provisioningState === 'Succeeded' &&
+      view?.statuses?.length === 2 &&
+      status(view?.statuses, 'PowerState/', 'PowerState/running') &&
+      status(
+        view?.statuses,
+        'ProvisioningState/',
+        'ProvisioningState/succeeded',
+      ) &&
+      Array.isArray(agent?.statuses) &&
+      agent.statuses.length === 1 &&
+      agent.statuses[0].code === 'ProvisioningState/succeeded' &&
+      agent.statuses[0].level === 'Info' &&
+      agent.statuses[0].displayStatus === 'Ready' &&
+      /^(0|[1-9]\d{0,5})(\.(0|[1-9]\d{0,5})){3}$/.test(
+        agent.vmAgentVersion ?? '',
+      ),
+    'Fresh bound VM/running/provisioning/Ready guest-agent evidence is unavailable; no new managed submission.',
+  );
+  // Documented Linux managed Run Command minimum; compare components, not strings.
+  const minimum = [2, 4, 0, 2],
+    version = agent.vmAgentVersion.split('.').map(Number);
+  const different = version.findIndex((part, index) => part !== minimum[index]);
+  requirePilot(
+    different === -1 || version[different] > minimum[different],
+    'Guest agent is older than the supported managed Run Command minimum 2.4.0.2.',
+  );
+  const inventory = await az.read(
+    [
+      'rest',
+      '--method',
+      'get',
+      '--url',
+      `${endpoint}/extensions?api-version=${vmApi}`,
+    ],
+    options,
+  );
+  requirePilot(
+    Array.isArray(inventory?.value) &&
+      inventory.nextLink == null &&
+      inventory.value.length <= 2 &&
+      new Set(inventory.value.map((item) => item.id?.toLowerCase())).size ===
+        inventory.value.length,
+    'Complete bounded VM extension inventory is unavailable; an error or partial page is not an empty inventory.',
+  );
+  let managed = false;
+  for (const extension of inventory.value) {
+    const id = extension.id?.toLowerCase();
+    requirePilot(
+      extension.properties?.provisioningState === 'Succeeded',
+      'A VM extension is failed, transitional or unknown; no new managed submission.',
+    );
+    if (id === RUN_COMMAND.handlerId.toLowerCase()) {
+      requirePilot(
+        existing && state.management?.receipt,
+        'Untracked managed handler; refusing first-use adoption.',
+      );
+      const configured = assertManagedHandler(extension);
+      const observed = await client.handler(signal);
+      const running = assertManagedHandler(observed, true);
+      requirePilot(
+        configured.configuredVersion === running.configuredVersion &&
+          observed.properties.instanceView.statuses?.length === 1 &&
+          observed.properties.instanceView.statuses[0].level === 'Info' &&
+          status(
+            observed.properties.instanceView.statuses,
+            'ProvisioningState/',
+            'ProvisioningState/succeeded',
+          ),
+        'Managed handler changed or has conflicting readiness during inspection.',
+      );
+      managed = true;
+    } else {
+      requirePilot(
+        id === `${VM.ids.id}/extensions/RunCommandLinux`.toLowerCase() &&
+          extension.type?.toLowerCase() ===
+            'microsoft.compute/virtualmachines/extensions' &&
+          extension.location?.toLowerCase() === SCOPE.location &&
+          extension.properties.publisher === 'Microsoft.CPlat.Core' &&
+          extension.properties.type === 'RunCommandLinux' &&
+          /^\d+\.\d+(?:\.\d+){0,2}$/.test(
+            extension.properties.typeHandlerVersion ?? '',
+          ),
+        'Unexpected VM extension; no new managed submission.',
+      );
+      const observed = await az.read(
+        [
+          'rest',
+          '--method',
+          'get',
+          '--url',
+          `${endpoint}/extensions/RunCommandLinux?api-version=${vmApi}&$expand=instanceView`,
+        ],
+        options,
+      );
+      requirePilot(
+        observed?.id?.toLowerCase() === id &&
+          observed.type === extension.type &&
+          observed.location === extension.location &&
+          observed.properties?.publisher === extension.properties.publisher &&
+          observed.properties.type === extension.properties.type &&
+          observed.properties.typeHandlerVersion ===
+            extension.properties.typeHandlerVersion &&
+          observed.properties.provisioningState === 'Succeeded' &&
+          observed.properties.instanceView?.statuses?.length === 1 &&
+          observed.properties.instanceView.statuses[0].level === 'Info' &&
+          status(
+            observed.properties.instanceView?.statuses,
+            'ProvisioningState/',
+            'ProvisioningState/succeeded',
+          ),
+        'Historical action handler readiness is unavailable; no new managed submission.',
+      );
+    }
+  }
+  requirePilot(
+    managed ||
+      (!existing &&
+        !state.management?.receipt &&
+        !state.management?.canary &&
+        !state.management?.privacyValidation),
+    'Previously tracked managed handler is missing; refusing recreation.',
+  );
+  signal.throwIfAborted();
+}
+
 function assertOperation(operation) {
   requirePilot(
     operation &&
@@ -689,6 +845,7 @@ export function managedTransport({
         ...(spec.disk ? { disk: spec.disk } : {}),
         ...(recovery ? { recovery } : {}),
       };
+      await submissionReady(az, client, state, existing, deadline);
       const next = { ...m, pending: operation };
       if (canary) {
         delete next.privacyValidation;

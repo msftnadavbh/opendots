@@ -26,7 +26,7 @@ function assertCreationTime(disk, state) {
     'Disk creation time is inconsistent with the recorded absence; check synchronized clocks and ownership, never recreate it.',
   );
 }
-function pin(state, values) {
+function assertPins(state, values) {
   for (const previous of [state.pins, state.binding])
     requirePilot(
       Object.entries(values).every(
@@ -35,6 +35,9 @@ function pin(state, values) {
       ),
       'Pinned VM, identity, OS/data disk or network endpoint changed; refusing an ARM update.',
     );
+}
+function pin(state, values) {
+  assertPins(state, values);
   state.pins = { ...state.pins, ...values };
 }
 function assertModelRole(role, id, principalId) {
@@ -77,6 +80,15 @@ export function validateVmState(state, parameters) {
 }
 
 export function assertVm(vm, parameters) {
+  assertVmConfiguration(vm, parameters);
+  requirePilot(
+    vm.properties.storageProfile.osDisk.managedDisk.storageAccountType ===
+      'StandardSSD_LRS',
+    'VM retained OS disk SKU differs. Stop; no automatic replacement.',
+  );
+}
+
+export function assertVmConfiguration(vm, parameters) {
   assertOwned(vm, VM.ids.id);
   const p = vm.properties,
     storage = p?.storageProfile,
@@ -102,7 +114,6 @@ export function assertVm(vm, parameters) {
       storage.osDisk?.managedDisk?.id?.toLowerCase() ===
         VM.ids.osDiskId.toLowerCase() &&
       storage.osDisk.deleteOption === 'Detach' &&
-      storage.osDisk.managedDisk.storageAccountType === 'StandardSSD_LRS' &&
       storage.dataDisks?.length === 1 &&
       storage.dataDisks[0].lun === 0 &&
       storage.dataDisks[0].createOption === 'Attach' &&
@@ -121,8 +132,15 @@ export function assertVm(vm, parameters) {
 export function assertDataDisk(disk, vmAttached = false) {
   assertOwned(disk, VM.ids.dataDiskId);
   requirePilot(
-    disk.sku?.name === 'StandardSSD_LRS' &&
-      disk.properties?.diskSizeGB === 32 &&
+    disk.sku?.name === 'StandardSSD_LRS',
+    'Data disk type, size, export policy or attachment differs.',
+  );
+  assertDataDiskProperties(disk, vmAttached);
+}
+
+export function assertDataDiskProperties(disk, vmAttached) {
+  requirePilot(
+    disk.properties?.diskSizeGB === 32 &&
       disk.properties.creationData?.createOption === 'Empty' &&
       disk.properties.networkAccessPolicy === 'DenyAll' &&
       disk.properties.publicNetworkAccess === 'Disabled' &&
@@ -379,9 +397,7 @@ export function assertNetwork({ nic, pip, nsg, vnet }) {
   }
 }
 
-export async function verifyVm(az, output, parameters, saved, save) {
-  const state = structuredClone(validateVmState(saved, parameters));
-  await az.verify();
+export async function readVmResources(az) {
   const resources = {};
   for (const [key, id, api] of [
     ['vm', VM.ids.id, '2025-11-01'],
@@ -393,20 +409,11 @@ export async function verifyVm(az, output, parameters, saved, save) {
     ['vnet', VM.ids.vnetId, '2025-05-01'],
   ])
     resources[key] = await readResource(az, id, api);
+  return resources;
+}
+
+export async function assertVmBindings(az, output, state, resources) {
   const { vm, disk, os, pip } = resources;
-  assertVm(vm, parameters);
-  assertDataDisk(disk, true);
-  assertOsDisk(os, vm);
-  requirePilot(
-    ['nic', 'pip', 'nsg', 'vnet'].every((key) => resources[key]),
-    'VM network resources are incomplete.',
-  );
-  assertNetwork(resources);
-  requirePilot(
-    vm.properties.provisioningState === 'Succeeded' &&
-      disk.properties.provisioningState === 'Succeeded',
-    'VM/disk is not ready or disk creation is not attributable to the recorded operation.',
-  );
   assertCreationTime(disk, state);
   const binding = {
     vmId: VM.ids.id,
@@ -435,7 +442,7 @@ export async function verifyVm(az, output, parameters, saved, save) {
       ),
       'Pinned VM, identity, OS disk, data disk, NIC or endpoint changed; no silent pin refresh.',
     );
-  pin(state, binding);
+  assertPins(state, binding);
   requirePilot(
     output.vm.uniqueId === binding.vmUniqueId &&
       output.vm.principalId === binding.principalId &&
@@ -450,23 +457,48 @@ export async function verifyVm(az, output, parameters, saved, save) {
     '2022-04-01',
   );
   assertModelRole(role, output.modelRoleAssignmentId, binding.principalId);
-  state.binding = binding;
-  state.creation.uniqueId = binding.diskUniqueId;
-  state.seenVmUniqueId = binding.vmUniqueId;
-  state.seenResourceIds = [...trackedIds];
-  state.modelRoleAssignmentId = output.modelRoleAssignmentId;
   requirePilot(
     !state.foundryPrincipalId ||
       state.foundryPrincipalId === output.foundryPrincipalId,
     'Pinned Foundry identity changed.',
   );
-  state.foundryPrincipalId = validateIdentity(output.foundryPrincipalId);
+  validateIdentity(output.foundryPrincipalId);
   requirePilot(
     !state.projectPrincipalId ||
       state.projectPrincipalId === output.projectPrincipalId,
     'Pinned project identity changed.',
   );
-  state.projectPrincipalId = validateIdentity(output.projectPrincipalId);
+  validateIdentity(output.projectPrincipalId);
+  return binding;
+}
+
+export async function verifyVm(az, output, parameters, saved, save) {
+  const state = structuredClone(validateVmState(saved, parameters));
+  await az.verify();
+  const resources = await readVmResources(az);
+  const { vm, disk, os } = resources;
+  assertVm(vm, parameters);
+  assertDataDisk(disk, true);
+  assertOsDisk(os, vm);
+  requirePilot(
+    ['nic', 'pip', 'nsg', 'vnet'].every((key) => resources[key]),
+    'VM network resources are incomplete.',
+  );
+  assertNetwork(resources);
+  requirePilot(
+    vm.properties.provisioningState === 'Succeeded' &&
+      disk.properties.provisioningState === 'Succeeded',
+    'VM/disk is not ready or disk creation is not attributable to the recorded operation.',
+  );
+  const binding = await assertVmBindings(az, output, state, resources);
+  pin(state, binding);
+  state.binding = binding;
+  state.creation.uniqueId = binding.diskUniqueId;
+  state.seenVmUniqueId = binding.vmUniqueId;
+  state.seenResourceIds = [...trackedIds];
+  state.modelRoleAssignmentId = output.modelRoleAssignmentId;
+  state.foundryPrincipalId = output.foundryPrincipalId;
+  state.projectPrincipalId = output.projectPrincipalId;
   await save(state);
   const view = await az.read([
     'vm',

@@ -102,6 +102,11 @@ export async function inspectGroupBeforeDeployment(az, state) {
     '--resource-group',
     SCOPE.resourceGroup,
   ]);
+  await inspectOwnedInventory(az, resources, state);
+  return true;
+}
+
+export async function inspectOwnedInventory(az, resources, state) {
   const ownedIds = [
     resourceId('Microsoft.App/sandboxGroups', SCOPE.sandboxGroupName),
     resourceId('Microsoft.ContainerRegistry/registries', REGISTRY_NAME),
@@ -210,7 +215,6 @@ export async function inspectGroupBeforeDeployment(az, state) {
     );
     assertOwned(resource, resource.id);
   }
-  return true;
 }
 
 export async function verifyLiveResources(az, output) {
@@ -406,11 +410,18 @@ export function readResource(az, id, api) {
   return az.read(['resource', 'show', '--ids', id, '--api-version', api]);
 }
 export function assertOsDisk(disk, vm) {
+  assertOsDiskAttachment(disk, vm);
+  requirePilot(
+    disk.sku?.name === 'StandardSSD_LRS',
+    'OS disk is not the exact attached pilot OS disk.',
+  );
+}
+
+export function assertOsDiskAttachment(disk, vm) {
   requirePilot(
     disk.id?.toLowerCase() === VM.ids.osDiskId.toLowerCase() &&
       disk.location?.toLowerCase() === SCOPE.location &&
       disk.managedBy?.toLowerCase() === VM.ids.id.toLowerCase() &&
-      disk.sku?.name === 'StandardSSD_LRS' &&
       disk.properties?.osType === 'Linux' &&
       vm.properties?.storageProfile?.osDisk?.managedDisk?.id?.toLowerCase() ===
         VM.ids.osDiskId.toLowerCase(),

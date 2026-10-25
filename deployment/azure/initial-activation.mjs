@@ -12,6 +12,7 @@ import {
   PilotError,
 } from './scope.mjs';
 import { verifyVm } from './vm-state.mjs';
+import { verifyExistingPilot } from './existing-pilot.mjs';
 import { units } from './vm.mjs';
 import { quote, rootCommand } from './ssh.mjs';
 
@@ -24,6 +25,19 @@ const program = readFileSync(
   new URL('./initial-activation.py', import.meta.url),
   'utf8',
 );
+const checks = readFileSync(
+  new URL('./existing-pilot-check.py', import.meta.url),
+  'utf8',
+);
+const readEnd = program.indexOf('\ndef publish(');
+const predicatesStart = program.indexOf('\ndef run(args):');
+const predicatesEnd = program.indexOf('\ndef replace_unit(');
+requirePilot(
+  readEnd > 0 && predicatesStart > readEnd && predicatesEnd > predicatesStart,
+  'Frozen recovery predicate boundaries changed; consult the architect.',
+);
+const readonlyPredicates =
+  program.slice(0, readEnd) + program.slice(predicatesStart, predicatesEnd);
 const sha = /^[a-f0-9]{64}$/;
 const uncertainStates = new WeakSet();
 const conflictStatus = 'post-intent-conflict';
@@ -63,9 +77,131 @@ export function initialActivationTarget(newImage) {
 
 function immutableState(state) {
   const value = structuredClone(state);
-  for (const key of ['image', 'management', 'initialActivationRecovery'])
+  for (const key of [
+    'image',
+    'management',
+    'initialActivationRecovery',
+    'existingPilot',
+  ])
     delete value[key];
   return value;
+}
+
+export function assertInitialActivationComplete(state) {
+  const completed = state.initialActivationRecovery;
+  requirePilot(
+    completed?.status === 'complete' &&
+      !completed.conflict &&
+      sha.test(completed.reviewSha256 ?? '') &&
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(
+        completed.operationId ?? '',
+      ),
+    'Complete the reviewed one-off initial recovery before any existing-pilot pull/start/configuration; no old-image activation.',
+  );
+  const { oldUnit, newUnit, ...target } = initialActivationTarget(state.image);
+  requirePilot(
+    Object.entries(target).every(([key, value]) => completed[key] === value) &&
+      isDeepStrictEqual(completed.binding, state.binding) &&
+      completed.fsUuid === state.fsUuid &&
+      completed.diskOperationId === state.operationId &&
+      isDeepStrictEqual(completed.receipt, {
+        operationId: completed.operationId,
+        status: 'applied',
+        oldUnitSha256: target.oldUnitSha256,
+        newUnitSha256: target.newUnitSha256,
+      }),
+    'Completed initial recovery receipt/image/resource bindings changed; no activation.',
+  );
+}
+
+// Call only after fresh VM verification; this gate never reopens one-off recovery.
+export function assertNormalActivation(state, output) {
+  if (Object.hasOwn(state, 'existingPilot') || state.image === INITIAL_IMAGE)
+    return assertInitialActivationComplete(state);
+  if (!Object.hasOwn(state, 'initialActivationRecovery')) return;
+  const recovery = state.initialActivationRecovery;
+  if (recovery?.status !== 'ineligible')
+    return assertInitialActivationComplete(state);
+  validateImage(state.image, output);
+  const { oldUnit, newUnit, ...target } = initialActivationTarget(
+    recovery.newImage,
+  );
+  requirePilot(
+    (state.provisioned === true || state.configured === true) &&
+      isDeepStrictEqual(recovery, { ...target, status: 'ineligible' }) &&
+      [state.management?.pending, state.management?.receipt].every(
+        (operation) =>
+          !operation ||
+          (['empty', 'status', 'image', 'disk', 'canary'].includes(
+            operation.schema,
+          ) &&
+            !Object.hasOwn(operation, 'recovery') &&
+            !Object.hasOwn(operation, 'conflict') &&
+            !Object.hasOwn(operation, 'status') &&
+            !Object.hasOwn(operation, 'oldUnitSha256') &&
+            !Object.hasOwn(operation, 'newUnitSha256') &&
+            !Object.hasOwn(operation.result ?? {}, 'status') &&
+            !Object.hasOwn(operation.result ?? {}, 'oldUnitSha256') &&
+            !Object.hasOwn(operation.result ?? {}, 'newUnitSha256')),
+      ),
+    'Only the exact pre-intent ineligible record on an already-activated strict-lane VM permits normal operations; transaction or contradictory recovery evidence requires reconciliation.',
+  );
+}
+
+function readonlyCommand(state, check) {
+  requirePilot(
+    state.fsUuid &&
+      state.binding &&
+      !state.management?.pending &&
+      !state.pullOperationId &&
+      !state.initialActivationRecovery?.conflict &&
+      !['prepared', 'applied', 'ineligible'].includes(
+        state.initialActivationRecovery?.status,
+      ),
+    'Read-only initial diagnostics require reconciled local state, never a pending/conflicting recovery.',
+  );
+  if (state.image !== INITIAL_IMAGE) assertInitialActivationComplete(state);
+  const rendered = units(state, state.image);
+  const plan = {
+    binding: Object.fromEntries(
+      ['vmId', 'vmUniqueId', 'diskId', 'diskUniqueId'].map((key) => [
+        key,
+        state.binding[key],
+      ]),
+    ),
+    fsUuid: state.fsUuid,
+    diskOperationId: state.operationId,
+    image: state.image,
+    unitSha256: digest(rendered.app),
+    mountSha256: digest(rendered.mount),
+    caddySha256: digest(rendered.caddy),
+    caddyServiceSha256: digest(rendered.caddyService),
+  };
+  // Reuse exact read-only definitions, excluding the recovery writers and __main__ transaction.
+  return rootCommand(
+    `/usr/bin/python3 -B -c ${quote(
+      `${readonlyPredicates}\n${checks}\n${check}(json.loads(${JSON.stringify(JSON.stringify(plan))}))`,
+    )}`,
+    180,
+  );
+}
+
+export async function inspectInitialGuest({ ssh, state }) {
+  requirePilot(
+    !state.provisioned && !state.configured,
+    'Initial diagnostics are not an active-application status check.',
+  );
+  await ssh.run(readonlyCommand(state, 'check_initial'), {
+    schema: 'empty',
+    timeoutMs: 260_000,
+  });
+}
+
+export async function inspectCaddy({ ssh, state }) {
+  await ssh.run(readonlyCommand(state, 'check_caddy'), {
+    schema: 'empty',
+    timeoutMs: 260_000,
+  });
 }
 
 async function dormantToken(az, output) {
@@ -193,19 +329,10 @@ export async function recoverInitialActivation({
     'Initial activation recovery is permanently ineligible; never delete evidence to retry.',
   );
   if (previous?.status === 'complete') {
+    assertInitialActivationComplete(state);
     requirePilot(
       Object.entries(review).every(([key, value]) => previous[key] === value) &&
-        state.image === target.newImage &&
-        previous.reviewSha256 === approval.reviewSha256 &&
-        isDeepStrictEqual(previous.binding, state.binding) &&
-        previous.fsUuid === state.fsUuid &&
-        previous.diskOperationId === state.operationId &&
-        isDeepStrictEqual(previous.receipt, {
-          operationId: previous.operationId,
-          status: 'applied',
-          oldUnitSha256: target.oldUnitSha256,
-          newUnitSha256: target.newUnitSha256,
-        }),
+        previous.reviewSha256 === approval.reviewSha256,
       'Completed one-off recovery cannot be rebound or used for another upgrade.',
     );
     return;
@@ -231,15 +358,11 @@ export async function recoverInitialActivation({
       !state.management?.pending,
     'Initial recovery requires the original image pin, verified filesystem, managed transport, and no pending management/pull. Reconcile first.',
   );
-  const verified = await verifyVm(
-    az,
-    output,
-    parameters,
-    state,
-    async () => {},
-  );
+  const verify = state.existingPilot ? verifyExistingPilot : verifyVm;
+  const verified = await verify(az, output, parameters, state, async () => {});
   requirePilot(
     verified.power === 'PowerState/running' &&
+      (!state.existingPilot || verified.provisioningState === 'Succeeded') &&
       isDeepStrictEqual(verified.state.binding, state.binding),
     'Fresh live VM/disk bindings or running state differ; no recovery write.',
   );

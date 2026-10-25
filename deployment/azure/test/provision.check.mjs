@@ -261,7 +261,7 @@ for (const mode of ['unknown-put', 'abort-running', 'abort-completed'])
       // Simulate the next locked CLI session after reconciliation, not resuming an aborted signal.
       const { managedTransport } = await import('../run-command.mjs');
       managed.guest = managedTransport({
-        az: {},
+        az: managed.az,
         state: managed.state,
         save: managed.save,
         client: managed.client,

@@ -1,21 +1,23 @@
 # OpenDots Azure pilot — operator runbook
 
 **Pilot only. No production target, automatic upgrades, resource deletion or cleanup command.**
-**Current status: cloud HOLD; not activated, not Azure Validated, and not live-complete.**
+**Current status: not activated, not Azure Validated, and not live-complete.**
 SSH is closed. Managed transport, its live privacy canary, the one-off image/unit recovery,
 and the integrated application backup API/HTTPS client must pass their gates before activation.
 Live privacy inspection and Azure validation remain lead-owned. Local tests do not establish
 cloud readiness. This runbook is not authorization for cloud operations.
 
-**Cloud hold:** the VM was deallocated under governance controls. Establish the permitted
-test/running window before resuming; do not change tags/schedules or run a restart loop.
-Local preparation is permitted; this document is not an authorization to bypass the cloud hold.
+The latest lead handoff reports the original VM running after a separately reviewed power start;
+guest eligibility is still unknown. Do not change tags/schedules or run a restart loop.
+This document and local fixture results are not live authorization or acceptance evidence.
 
-The recorded drift includes a governance-created default-deny NSG attached to the application
-subnet; the NIC's 80/443 permit does not override it. The data disk's ownership tags are absent,
-so inventory validation refuses it even if its immutable ID and attachment match.
-Do not restore tags, adopt/detach/alter the added NSG, or redeploy to erase this drift.
-Current state must be revalidated under separate authorization before activation.
+The recorded drift includes both original disks at `Standard_LRS`, absent data-disk tags, and
+a governance-created NSG on the application subnet. The fixed existing-resource lane below targets
+the separately authorized **post-change** `opendots-web` rule, not the earlier empty/default-deny profile.
+The latest lead handoff reports that exact single-rule change applied after review. The operator still
+freshly verifies it and performs no network write. The external NSG has copied pilot tags; those tags
+are observed metadata, **not ownership or adoption authority**. No tag restoration, NSG adoption/detachment,
+network workaround or ARM redeployment to erase drift is implemented.
 
 ## Fixed boundary and trust model
 
@@ -25,7 +27,8 @@ accounts or deployments. Preserve those source pins; changing them is not a supp
 Preserve the existing Intelligence project key and owner/thread IDs.
 
 The pinned VM uses Standard_D2als_v7 and Ubuntu 24.04 Gen2 version 24.04.202610160.
-Its data disk is 32 GiB StandardSSD, NVMe LUN0, ext4. The model deployment is
+The ARM contract requests a 32 GiB StandardSSD data disk, NVMe LUN0, ext4; the existing lane recognizes
+only the original bound disks' observed `Standard_LRS` drift. The model deployment is
 `dot-chat` (gpt-5.4-mini 2026-03-17, GlobalStandard 50).
 
 The VM fallback is selected because Azure Policy enforces Entra-only Foundry access
@@ -39,7 +42,19 @@ not an application/runtime migration.
 Caddy exposes 443 and 80 (ACME/HTTPS redirection). **SSH is closed, including the historical operator `/32`.**
 The exact NSG contract is `https-and-acme` (priority100, Allow Internet TCP80/443) and
 `deny-other-inbound` (priority4096, Deny all). Do not restore port22, use an alternate
-port, JIT, reverse SSH, tunnels or a policy exception. A further NSG/governance change is a stop condition.
+port, JIT, reverse SSH, tunnels or a policy exception. The existing lane additionally requires the
+externally managed `vnet-opendots-pilot-app-nsg-eastus2` attached only to the app subnet, no NIC attachments,
+unchanged six default rules, and exactly `opendots-web`: priority100, Inbound Allow TCP, source `Internet`,
+source port `*`, destination `10.42.0.4/32`, ports80/443. Only the exact single-host spelling `10.42.0.4`
+is equivalent. The original NIC must still have one primary Dynamic private IPv4 `10.42.0.4`, the original
+VM/PIP/subnet links and the original two NIC NSG rules. Any reversal, extra rule or address change stops work;
+there is no automatic retarget/reapply or empty-NSG fallback.
+Both its dedicated GET and group inventory must report exactly
+`{application: 'opendots', environment: 'pilot', managedBy: 'opendots-pilot-v1'}` (key order is irrelevant).
+The dedicated GET must also report `properties.resourceGuid = ea14dfd0-7317-47a2-bd0d-0c3271f4d50d`;
+the generic inventory need not include this GUID. Missing, partial, extra or conflicting tags, or a
+missing/different GUID at the same resource ID, stop work. These exact tags and GUID are included in
+reconciliation evidence while `management` remains `external`; no pin learning or tag writes are permitted.
 The app is published only at host loopback `127.0.0.1:4310`. Docker 28+ is required at installation
 and every service start. Caddy access and HTTP-error log namespaces are excluded; TLS and other
 non-request operational diagnostics remain available. Never enable request/debug logging with real credentials.
@@ -70,7 +85,7 @@ set -eu
 mkdir -p -m 700 /tmp/opencode
 "$HOME/.azure/bin/bicep" build infra/main.bicep --outfile /tmp/opencode/opendots-pilot-arm.json
 PILOT_ARM_TEMPLATE=/tmp/opencode/opendots-pilot-arm.json npm --prefix deployment/azure test
-python3 -m unittest discover -s deployment/azure/test -p '*_test.py'
+python3 -B -m unittest discover -s deployment/azure/test -p '*_test.py'
 ```
 
 Do not omit `PILOT_ARM_TEMPLATE`: the compiled contract intentionally fails without it. It checks
@@ -88,7 +103,7 @@ step. Require all backup tests with zero skips in the explicit sandbox, plus the
 integrated suite. A wrong opted-in profile fails before any pressure allocation.
 Verify the actual image with the exact nonroot/read-only/capability/resource flags in `vm-host.sh`.
 The local environment may require the integrity-checked offline npm cache; never disable TLS verification.
-Only after local evidence and independent review, follow **azure-validate**:
+For infrastructure work only, after local evidence and independent review, follow **azure-validate**:
 
 ```sh
 node deployment/azure/pilot.mjs validate
@@ -99,6 +114,79 @@ Review private `artifacts/azure-pilot/{validate,what-if}.json`. Require provider
 only the approved RG, no deletions/replacements or unexpected changes. Inherited policies are read
 through ARM's explicit `atScope()` query; the CLI listing omitted them in this tenant.
 Azure still enforces custom policies. Never create an exemption or change policy to make deployment pass.
+These strict infrastructure commands still reject the observed drift. They are not prerequisites to
+redeploy or normalize this already-created VM; use the separately reviewed existing-resource lane instead.
+
+## Fixed existing-VM reconciliation and read-only checks
+
+After the lead verifies the exact post-change network profile, independent review, and current authority:
+
+```sh
+node deployment/azure/pilot.mjs reconcile-existing
+```
+
+`reconcile-existing` is control-plane read-only and performs no guest submission. It requires the complete
+original creation record, original image pin, filesystem UUID, immutable VM/identity/OS/data/NIC/PIP/FQDN pins,
+parameter hash, tracked resource inventory and ARM-output/Foundry role comparisons. Initial recording requires
+no activation markers, pending management/pull or recovery transaction. It recognizes **only** the specified
+disk/tag/network profile; even partially restored data tags, another disk SKU, foreign ownership, attachments,
+rules or inventory are rejected. The NSG remains external, never relabeled as pilot-owned.
+
+Evidence is a separate `existingPilot` metadata member, not a binding or format permit. The same atomic0600
+state write records the initial state anchor, immutable-state and output hashes, exact controlled configuration,
+and current state hash. Hashes use the operator's JSON serialization (two-space indentation and final newline).
+The initial anchor is historical evidence, **not** a hash every later state must retain. The locked existing-lane
+save path updates the current hash along with genuine management/recovery/provisioning receipts, without changing
+the anchor or immutable pins. A stale hash or failed save stops work; do not edit hashes, delete records or
+clear pending/recovery facts to continue. Re-running reconciliation verifies existing evidence; it cannot reset it.
+Earlier version1 evidence without the exact governance tags/GUID is rejected, not migrated or refreshed.
+The lead reports that no such evidence has been recorded live.
+
+Once recorded, build, status, canary, recovery and activation use fresh existing-resource verification.
+The internal fresh verifier in one-off recovery uses this lane too. `prepare`, `validate`, `what-if`, deployment,
+`recordDeployment`, ownership guards and ARM SKU/inventory rules remain strict. Existing-lane `resume` cannot
+power-start a stopped VM. Reconciliation itself cannot format, mount, repair, start, build or pull anything.
+
+`initial-check` reuses the frozen recovery's read-only predicates: original helper/unit bytes and modes,
+NVMe/filesystem/mount binding, empty images/containers/data/runtime configuration, inactive/disabled application,
+and no activation job/history. It also checks the pinned mount unit. Before activation, existing-lane `status`
+uses this check and reports an inactive application rather than falsely claiming an active service.
+`caddy-check` separately verifies fixed config/drop-in hashes and modes, readability **as the caddy user**, and
+the loaded/running Caddy service with no extra drop-in, queued job or reload requirement. Neither check starts,
+mounts, repairs, reloads, configures or pulls. They expose only the existing empty-result success/failure receipt,
+never logs, runtime.env, database contents or config contents. Failure is a stop/diagnostic finding, not an absence
+or permission to repair. These diagnostics do not grant recovery or activation eligibility.
+
+**First-use order is a live gate, not a fixture assumption.** Before the first agent-backed submission, the lead
+must freshly record the first-use basis: no prior management/pending/receipt/canary/privacy approval, a404 for the
+fixed managed child, the bound running/Succeeded VM with supported Ready agent, and the complete empty extension
+inventory. The current handoff reports no management field, child404, Ready2.16.0.2 and no extensions; retain the
+actual evidence and current state hash, not a permanent requirement to match the initial whole-state hash.
+
+Make `management-canary` the first submission and **do not chain another guest command**. After that submission,
+the lead must read the actual extension collection, the exact handler GET **with instanceView**, and the canary's
+managed-child GET **with and without instanceView**, before any reuse. Reconcile an unknown pending result with
+GET only. Unexpected fields, versions, status shapes or missing evidence require lead/architect consultation;
+do not blindly edit fixtures, coerce a response or widen the handler gate. Fixture success does not prove the
+live handler format. The canary's own handler lookup is not a substitute for this independent inspection.
+
+Only after those first-submission surfaces are preserved and verified may these fixed nonsecret probes reuse
+the child:
+
+```sh
+node deployment/azure/pilot.mjs initial-check
+node deployment/azure/pilot.mjs caddy-check
+```
+
+Actual agent/log/process privacy inspection remains lead-owned below; these host checks do not implement or
+attest it. Separately reviewed nonsecret probes must hold the same operator/guest locks, freshly verify the
+existing lane, use `existingPilotSave` and `managedTransport`, and reconcile pending receipts. No raw command/log
+interface is exposed by the CLI. Complete every required privacy inspection before recording approval.
+
+Do not pull a temporary smoke image: any image/container closes initial recovery eligibility. Build in ACR,
+review the resulting digest, complete the protected one-off recovery, then use the normal provision/configure
+commands. The CLI requires the bound completed recovery receipt before existing-pilot provision, configure,
+restart or resume; the original old image cannot be activated through an alternate route.
 
 ## Managed Run Command and the mandatory privacy gate
 
@@ -125,6 +213,20 @@ An abort before intent/invalidation leaves prior state unchanged. Once a new can
 restoration never resurrects the old candidate/privacy approval. A failed restoration save poisons the transport:
 reload persistent state. After a crash, old/missing remote state is **not** proof of nondispatch.
 
+Every **new** command/canary submission has a mandatory fresh readiness check in the shared transport, under its
+operation deadline, before intent publication or durable canary invalidation. It rechecks the exact bound VM and
+principal, running/Succeeded state, Ready agent and the documented minimum agent version2.4.0.2 (numeric component
+comparison; the handed-off2.16.0.2 is supported). A complete bounded extension collection must contain only the
+exact ready managed handler and/or historical action handler; missing, failed, transitional, unexpected or
+partial inventory fails closed. Managed handler absence is permitted only for legitimate first use with no
+tracked child/receipt/canary. Missing a previously tracked handler is not permission to recreate it.
+
+Readiness failure means zero PUTs, no new pending intent and no durable canary-proof invalidation. It is not a
+nondispatch claim about any earlier uncertain operation. GET-only reconciliation/polling has no submission-readiness
+gate and stays available when the agent is unhealthy or the VM is stopped, subject to immutable scope/continuity
+checks. The transport source hash changed with this gate: old privacy approvals fail closed, but historical
+pending/receipt records retain their **recorded** hashes for reconciliation. Never rewrite them to the new hash.
+
 Inventory permits exactly the pending public contract or its durable prior receipt's public contract, selected by
 operation ID, with full source/tags/timeout/ownership/binding checks. This keeps read-only status/HTTPS-backup
 preflight reachable when a PUT did not land. `management-reconcile` performs bounded GET polling only: it may wait
@@ -140,6 +242,13 @@ Standard caller budgets additionally cover the root's30-second lock wait,10-seco
 Budgets below31 seconds are rejected; the1320-second cap and existing root-command timeouts are unchanged.
 Both canary children share one execution deadline. Slow authentication/provider scheduling can still exhaust the
 client budget; that is an unknown outcome to reconcile, not evidence that the guest stopped.
+
+**The configured timeout margins are not guaranteed remaining wall-clock time.** Authentication, readiness
+inspection and resource GETs consume the existing outer client budget; the configured guest/provider timeouts
+are not reduced by that elapsed preflight time. The client can therefore expire before remote completion.
+A failure before durable intent creates no pending operation and sends no PUT. Once dispatch is uncertain,
+retain pending and reconcile by GET; only the existing proven-nondispatch/pre-client restoration rules apply.
+Do not retry PUT, bump budgets, add a wait loop or change the1320-second cap to hide this uncertainty.
 
 **Retention decision:** encrypted protected settings/input and platform/agent history may remain on the retained child
 or guest and are within the privileged control-plane/guest-admin trust boundary. There is **no mandatory clearing PUT**:
@@ -259,7 +368,7 @@ checked, and systemd reloaded without start/enable. A durable guest applied rece
 record precede the atomic **image-pin + recovery-metadata only** update. No helper, data, resource, identity,
 SSH, filesystem or format pin is changed. The old backup/intent/receipt is retained.
 
-On interruption: retain every record; subject to the cloud hold, reconcile pending management before considering
+On interruption: retain every record and current running-window authorization; reconcile pending management before considering
 the **same reviewed target**. Prepared+old-unit and prepared+new-unit states are explicitly reconciled only when all
 gates remain satisfied; applied+new-unit verifies its applied receipt without rewriting. New unit bytes alone never
 authorize image-pin advancement. Checks also run after guest applied-receipt publication and before local pin commit.
@@ -275,10 +384,28 @@ or missing evidence is not permission to adopt, roll back or erase evidence.
 Never clear the pin, roll back blindly or delete an eligibility observation. A failed/unknown provider execution
 without a valid wrapper receipt stays pending and requires lead/architect reconciliation, not an automatic retry.
 
+### Benign rejection on an already-activated normal VM
+
+A mistaken recovery request on an already-provisioned/configured **strict-lane** VM can create a pre-intent
+`ineligible` record without submitting guest work. After fresh strict VM verification, normal provision,
+configure, restart and resume remain available only for this exact exception: a valid pinned noninitial image,
+`provisioned === true` or `configured === true`, no existing-pilot metadata, and a record with exactly `version`,
+`status`, `oldImage`, `newImage`, `oldUnitSha256`, `newUnitSha256` (`version:1`, `status:ineligible`). The target
+fields must match the frozen renderer for the record's `newImage`; that refused target need not equal the
+currently installed image. Any transaction metadata, receipt, conflict or unknown field—even null/false—or
+contradictory recovery evidence in management state blocks this exception. Ordinary unrelated receipts remain
+valid, and unrelated pending management still requires the normal reconciliation procedure.
+
+This preserves the ineligible record and never reopens recovery or authorizes an image change. Strict-lane
+absence of a recovery property preserves normal behavior; a present null/malformed property is not absence.
+Existing-pilot operations and the original initial image always require a valid completed recovery. Other
+present records must validate as complete; prepared/applied/conflicting or malformed records block activation.
+
 ## Deploy and activate — only after all current gates
 
 ```sh
-# Lead-only; do not redeploy existing resources merely to repair SSH.
+# Lead-only; reconcile the approved existing topology and complete reviewed initial recovery first.
+# Do not redeploy existing resources merely to repair drift or SSH.
 # validate/what-if/deploy/build are separate reviewed cloud operations, not local verification.
 # Read the nonsecret immutable image reference from artifacts/azure-pilot/image.json.
 node deployment/azure/pilot.mjs provision artifacts/azure-pilot/arm-outputs.json <exact-registry/repository@sha256:digest>
@@ -351,9 +478,15 @@ node deployment/azure/pilot.mjs stop
 node deployment/azure/pilot.mjs resume
 ```
 
-`stop` gracefully stops the application then deallocates the VM, retaining both disks and its Public IP.
-Disk, registry and other charges can continue. `resume` verifies identities/mount/service; recheck HTTPS,
-model access and conversation continuity. This is a single-instance pilot, not HA.
+`stop` explicitly means **compute off**: fresh verification, graceful guest application shutdown, a validated
+successful managed completion receipt, then VM deallocation, retaining both disks and its Public IP. An already
+stopped/deallocated VM is a no-op without guest submission. An unhealthy agent, failed/unknown guest stop or
+unresolved pending operation prevents deallocation; this is **not an emergency-shutdown guarantee**. Preserve
+pending and reconcile instead of forcing power off. No force-off or automatic shutdown fallback exists.
+Existing-lane `resume` cannot power-start the VM: that requires a separately authorized power-only operation
+outside this lane. Normal strict-lane resume retains its verified behavior. Recheck HTTPS, model access and
+conversation continuity afterward. Disk, registry and other charges can continue. This is a single-instance
+pilot, not HA.
 
 `backup` uses owner-authenticated `POST /api/backup` on the exact live owned HTTPS origin, not SSH or
 Run Command output. The endpoint requires an explicit bearer token, configured Origin and empty JSON;
