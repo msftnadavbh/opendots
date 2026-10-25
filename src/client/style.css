@@ -3519,6 +3519,17 @@ h3 {
   height: 100%;
   object-fit: contain;
 }
+.mascot > img.dot-photo {
+  border-radius: 50%;
+  object-fit: cover;
+}
+.dot-photo-settings {
+  margin: 20px 0;
+}
+.dot-photo-settings .mascot {
+  width: 64px;
+  height: 64px;
+}
 .template-app .dot-nav > .mascot.small {
   width: 30px;
   height: 30px;

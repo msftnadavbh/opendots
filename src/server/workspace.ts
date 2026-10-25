@@ -21,6 +21,7 @@ export class WorkspaceStore {
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS spaces(id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, createdAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS dots(id TEXT PRIMARY KEY, spaceId TEXT NOT NULL, name TEXT NOT NULL, instructions TEXT NOT NULL, researchAllowed INTEGER NOT NULL, memoryAllowed INTEGER NOT NULL, createdAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS dot_photos(dotId TEXT PRIMARY KEY, version TEXT NOT NULL, photo BLOB NOT NULL CHECK(typeof(photo)='blob' AND length(photo) BETWEEN 1 AND 262144));
       CREATE TABLE IF NOT EXISTS thread_bindings(id TEXT PRIMARY KEY, dotId TEXT NOT NULL, ownerId TEXT NOT NULL, title TEXT NOT NULL, createdAt INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS task_threads(taskId TEXT PRIMARY KEY, threadId TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS calls(id TEXT PRIMARY KEY, threadId TEXT NOT NULL, startedAt INTEGER NOT NULL, endedAt INTEGER, status TEXT NOT NULL, transcript TEXT NOT NULL, error TEXT);
@@ -103,7 +104,9 @@ export class WorkspaceStore {
   }
   dots(): Dot[] {
     return this.db
-      .prepare('SELECT * FROM dots ORDER BY createdAt')
+      .prepare(
+        'SELECT dots.*, dot_photos.version AS photoVersion FROM dots LEFT JOIN dot_photos ON dot_photos.dotId=dots.id ORDER BY dots.createdAt',
+      )
       .all()
       .map((row) => ({
         ...row,
@@ -122,6 +125,35 @@ export class WorkspaceStore {
   }
   dot(id: string) {
     return this.dots().find((dot) => dot.id === id);
+  }
+  dotPhoto(id: string) {
+    if (!this.dot(id)) throw new Error('Dot not found.');
+    const row = this.db
+      .prepare('SELECT version, photo FROM dot_photos WHERE dotId=?')
+      .get(id);
+    return row
+      ? {
+          photoVersion: String(row.version),
+          dataUrl: `data:image/jpeg;base64,${Buffer.from(row.photo as Uint8Array).toString('base64')}`,
+        }
+      : null;
+  }
+  saveDotPhoto(id: string, photo: Buffer) {
+    if (!this.dot(id)) throw new Error('Dot not found.');
+    const photoVersion = randomUUID();
+    this.db
+      .prepare(
+        'INSERT INTO dot_photos(dotId, version, photo) VALUES (?, ?, ?) ON CONFLICT(dotId) DO UPDATE SET version=excluded.version, photo=excluded.photo',
+      )
+      .run(id, photoVersion, photo);
+    return { photoVersion };
+  }
+  deleteDotPhoto(id: string) {
+    if (!this.dot(id)) throw new Error('Dot not found.');
+    return (
+      this.db.prepare('DELETE FROM dot_photos WHERE dotId=?').run(id).changes >
+      0
+    );
   }
   createDot(
     spaceId: string,

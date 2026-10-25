@@ -1,9 +1,10 @@
 import { parallelSources, type WebConfig, type WebSource } from './parallel.js';
 import { z } from 'zod';
 import type { Memory, Result } from '../shared/types.js';
+import type { ModelCredential } from './model-auth.js';
 export interface Config extends WebConfig {
   mode: 'sample' | 'live';
-  apiKey?: string;
+  apiKey?: ModelCredential;
   baseUrl: string;
   model?: string;
   browserUrl?: string;
@@ -88,7 +89,7 @@ export async function research(
   }
   if (!configured(config))
     throw new Error(
-      'Live mode is not configured. Set OPENAI_API_KEY and OPENAI_MODEL; browser research also needs BROWSER_URL and BROWSER_SECRET. Research must not be disabled.',
+      'Live mode is not configured. Set OPENAI_MODEL and OPENAI_API_KEY (or OPENAI_AUTH_MODE=managed-identity with an Azure OpenAI v1 OPENAI_BASE_URL); browser research also needs BROWSER_URL and BROWSER_SECRET. Research must not be disabled.',
     );
   let pages: WebSource[];
   const limitations: string[] = [];
@@ -146,15 +147,19 @@ export async function research(
   }
   progress('Sources captured. Writing a brief grounded in the evidence.');
   signal.throwIfAborted();
+  const token =
+    typeof config.apiKey === 'function' ? await config.apiKey() : config.apiKey;
+  signal.throwIfAborted();
   const completion = await fetch(
     `${config.baseUrl.replace(/\/$/, '')}/chat/completions`,
     {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${token}`,
       },
       signal,
+      redirect: 'error',
       body: JSON.stringify({
         model: config.model,
         temperature: 0.3,

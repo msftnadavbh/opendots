@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { Platform } from './platform.js';
 import { VoiceService } from './voice.js';
+import { PhotoValidationError, validateDotPhoto } from './dot-photo.js';
 import {
   learningContainerIdSchema,
   validateLearningSettings,
@@ -141,6 +142,29 @@ export function workspaceRoutes(platform: Platform, voice: VoiceService) {
     }
     return c.json(platform.workspace.updateDot(c.req.param('id'), data.data));
   });
+  app.get('/dots/:id/photo', (c) => {
+    const photo = platform.workspace.dotPhoto(c.req.param('id'));
+    return photo ? c.json(photo) : c.json({ error: 'Photo not found.' }, 404);
+  });
+  app.put('/dots/:id/photo', async (c) => {
+    const id = c.req.param('id');
+    if (!platform.workspace.dot(id))
+      return c.json({ error: 'Dot not found.' }, 404);
+    let photo: Buffer;
+    try {
+      photo = await validateDotPhoto(await c.req.json().catch(() => null));
+    } catch (error) {
+      if (error instanceof PhotoValidationError)
+        return c.json({ error: error.message }, error.status);
+      throw error;
+    }
+    return c.json(platform.workspace.saveDotPhoto(id, photo));
+  });
+  app.delete('/dots/:id/photo', (c) =>
+    platform.workspace.deleteDotPhoto(c.req.param('id'))
+      ? c.json({ photoVersion: null })
+      : c.json({ error: 'Photo not found.' }, 404),
+  );
   app.post('/conversations', async (c) => {
     const data = z
       .object({

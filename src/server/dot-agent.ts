@@ -29,6 +29,7 @@ import {
 } from './platform-config.js';
 import { browserResponse } from './research.js';
 import { answerObserver, type SetupTelemetry } from './setup-telemetry.js';
+import { startAgentTurn } from './runtime-telemetry.js';
 const channelError = () => ({
   type: EventType.RUN_ERROR,
   message:
@@ -63,12 +64,15 @@ export class DotAgent extends AbstractAgent {
   }
   run(input: RunAgentInput): Observable<BaseEvent> {
     return new Observable((subscriber) => {
+      const endTurn = startAgentTurn(this.channel ? 'channel' : 'web');
       const controller = new AbortController();
       this.controller = controller;
       let subscription: { unsubscribe(): void } | undefined;
       let watcher: ReturnType<typeof setInterval> | undefined;
       let finished = false;
       let configurationFailure = false;
+      const privateErrors =
+        this.channel || typeof this.config.apiKey === 'function';
       const turnTimeLimitMs =
         this.config.agentRunTimeoutMs ?? DEFAULT_AGENT_RUN_TIMEOUT_MS;
       const observe = answerObserver((event) =>
@@ -79,15 +83,17 @@ export class DotAgent extends AbstractAgent {
         message: `This turn reached the ${turnTimeLimitMs / 1000} second time limit and was stopped. Try a smaller request.`,
       });
       const timeout = setTimeout(() => {
+        endTurn('timeout');
         observe({ type: EventType.RUN_ERROR });
         subscriber.next(this.channel ? channelError() : timeLimitError());
         subscriber.complete();
       }, turnTimeLimitMs);
       const fail = (error: unknown) => {
         if (subscriber.closed) return;
+        endTurn('error');
         if (!configurationFailure) observe({ type: EventType.RUN_ERROR });
         subscriber.next(
-          this.channel
+          privateErrors
             ? channelError()
             : {
                 type: EventType.RUN_ERROR,
@@ -334,6 +340,12 @@ export class DotAgent extends AbstractAgent {
           baseURL: this.config.baseUrl ?? 'https://api.openai.com/v1',
           api: 'chat-completions',
           maxRetries: 1,
+          ...(typeof this.config.apiKey === 'function'
+            ? {
+                fetchOptions: { redirect: 'error' as const },
+                logLevel: 'off' as const,
+              }
+            : {}),
         });
         const start = async () => {
           const appTools =
@@ -384,6 +396,8 @@ export class DotAgent extends AbstractAgent {
               });
               return chat({
                 adapter,
+                debug:
+                  typeof this.config.apiKey === 'function' ? false : undefined,
                 messages: converted.messages,
                 systemPrompts: [
                   prompt,
@@ -427,6 +441,10 @@ export class DotAgent extends AbstractAgent {
             })
             .subscribe({
               next: (event) => {
+                if (event.type === EventType.RUN_ERROR)
+                  endTurn(controller.signal.aborted ? 'cancelled' : 'error');
+                else if (event.type === EventType.RUN_FINISHED)
+                  endTurn(controller.signal.aborted ? 'cancelled' : 'success');
                 if (controller.signal.aborted)
                   observe({ type: EventType.RUN_ERROR });
                 observe(event);
@@ -436,19 +454,21 @@ export class DotAgent extends AbstractAgent {
                 )
                   finished = true;
                 subscriber.next(
-                  this.channel && event.type === EventType.RUN_ERROR
+                  privateErrors && event.type === EventType.RUN_ERROR
                     ? channelError()
                     : event,
                 );
               },
               error: (error: unknown) => {
+                endTurn(controller.signal.aborted ? 'cancelled' : 'error');
                 observe({ type: EventType.RUN_ERROR });
-                if (this.channel) {
+                if (privateErrors) {
                   subscriber.next(channelError());
                   subscriber.complete();
                 } else subscriber.error(error);
               },
               complete: () => {
+                endTurn(controller.signal.aborted ? 'cancelled' : 'error');
                 if (controller.signal.aborted && !finished)
                   observe({ type: EventType.RUN_ERROR });
                 subscriber.complete();
@@ -460,6 +480,7 @@ export class DotAgent extends AbstractAgent {
         fail(error);
       }
       return () => {
+        endTurn('cancelled');
         clearTimeout(timeout);
         clearInterval(watcher);
         controller.abort();

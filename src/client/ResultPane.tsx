@@ -9,7 +9,7 @@ import {
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import type { Dot, Result, Status } from '../shared/types';
-import { Mascot } from './Mascot';
+import { DotAvatar } from './DotAvatar';
 import { ComputerPanel } from './ComputerPanel';
 export function ResultPane({
   latest,
@@ -175,9 +175,8 @@ export function ResultPane({
         </div>
       ) : (
         <div className="pane-empty">
-          <Mascot
-            identity={defaultDotId}
-            name={dots.find((dot) => dot.id === defaultDotId)?.name}
+          <DotAvatar
+            dot={dots.find((dot) => dot.id === defaultDotId)}
             state={dotState}
           />
           <h3>A little space for your findings.</h3>

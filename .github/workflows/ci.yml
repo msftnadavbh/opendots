@@ -19,4 +19,13 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
+      - name: Backup isolation and resource limits (mandatory)
+        run: |
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            --memory 3g --memory-swap 3g --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env OPENDOTS_BACKUP_TEST_SANDBOX=1 --env DO_NOT_TRACK=1 \
+            --env COPILOTKIT_TELEMETRY_DISABLED=1 \
+            --mount type=bind,src="$PWD",dst=/app --workdir /app \
+            node:24-bookworm-slim node node_modules/vitest/vitest.mjs run tests/backup.test.ts --maxWorkers=1
       - run: npm run build

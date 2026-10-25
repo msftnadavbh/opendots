@@ -1,5 +1,13 @@
 let token = sessionStorage.getItem('opendots-token') ?? '';
+const authListeners = new Set<(unauthorized: boolean) => void>();
+export function onAuthChange(listener: (unauthorized: boolean) => void) {
+  authListeners.add(listener);
+  return () => {
+    authListeners.delete(listener);
+  };
+}
 export function setToken(value: string) {
+  if (token !== value) for (const listener of authListeners) listener(false);
   token = value;
   if (value) sessionStorage.setItem('opendots-token', value);
   else sessionStorage.removeItem('opendots-token');
@@ -29,6 +37,8 @@ export async function api<T>(
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
+  if (response.status === 401)
+    for (const listener of authListeners) listener(true);
   const data = (await response
     .json()
     .catch(() => ({ error: 'Server returned an unreadable response.' }))) as {

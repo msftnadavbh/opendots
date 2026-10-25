@@ -31,7 +31,9 @@ import type {
   State,
   WorkspaceState,
 } from '../shared/types';
-import { api, ApiError, authHeaders, setToken } from './api';
+import { api, ApiError, authHeaders, onAuthChange, setToken } from './api';
+import { DotAvatar, DotPhotos } from './DotAvatar';
+import { DotPhotoCache, type DotPhoto } from './dot-photo-cache';
 import { trackSetupStep } from './setup-telemetry';
 import {
   applyCaptureResult,
@@ -121,6 +123,17 @@ export function App() {
     );
   const [auth, setAuth] = useState('');
   const [needsAuth, setNeedsAuth] = useState(false);
+  const [photos] = useState(
+    () => new DotPhotoCache((id) => api<DotPhoto>(`/dots/${id}/photo`)),
+  );
+  useEffect(
+    () =>
+      onAuthChange((unauthorized) => {
+        photos.clear();
+        if (unauthorized) setNeedsAuth(true);
+      }),
+    [photos],
+  );
   const [dialog, setDialog] = useState<Dialog>();
   const [mobile, setMobile] = useState(false);
   const [navCollapsed, setNavCollapsed] = useState(false);
@@ -413,7 +426,7 @@ export function App() {
                 }
                 onClick={() => chooseDot(item)}
               >
-                <Mascot identity={item.id} name={item.name} small decorative />
+                <DotAvatar dot={item} small decorative />
                 <span>{item.name}</span>
               </button>
               <button
@@ -638,9 +651,8 @@ export function App() {
               ) : (
                 <div className="new-conversation">
                   <div className="empty-chat-persona">
-                    <Mascot
-                      identity={dot.id}
-                      name={dot.name}
+                    <DotAvatar
+                      dot={dot}
                       state={state.settings.paused ? 'paused' : 'idle'}
                     />
                     <h2>{dot.name}</h2>
@@ -951,15 +963,23 @@ export function App() {
           workspace={workspace}
           onClose={() => setDialog(undefined)}
           mutate={mutate}
+          onPhotoSaved={refresh}
         />
       )}
     </div>
   );
-  return configured ? (
-    <CopilotKitProvider runtimeUrl="/api/copilotkit" headers={authHeaders()}>
-      {content}
-    </CopilotKitProvider>
-  ) : (
-    content
+  return (
+    <DotPhotos.Provider value={photos}>
+      {configured ? (
+        <CopilotKitProvider
+          runtimeUrl="/api/copilotkit"
+          headers={authHeaders()}
+        >
+          {content}
+        </CopilotKitProvider>
+      ) : (
+        content
+      )}
+    </DotPhotos.Provider>
   );
 }

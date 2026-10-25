@@ -7,14 +7,17 @@ import { Store } from '../src/server/store.js';
 import { WorkspaceStore } from '../src/server/workspace.js';
 import { pageReviewTool } from '../src/shared/page-review.js';
 import { connectionActionTool } from '../src/shared/connection-types.js';
+import type { ModelCredential } from '../src/server/model-auth.js';
+import { modelRedirect } from './fixtures/model-redirect.js';
 
 const databases: Array<{ close(): void }> = [];
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   databases.splice(0).forEach((db) => db.close());
 });
 
-function fixture() {
+function fixture(apiKey: ModelCredential = 'fixture') {
   const store = new Store(':memory:');
   const workspace = new WorkspaceStore(':memory:', 'owner');
   databases.push(store, workspace);
@@ -25,7 +28,7 @@ function fixture() {
     workspace,
     {
       intelligenceKey: 'fixture',
-      apiKey: 'fixture',
+      apiKey,
       model: 'custom-model',
       baseUrl: 'https://unused.invalid/v1',
       runtimeUrl: '',
@@ -117,6 +120,12 @@ it('executes a page tool, continues with its result, and emits AG-UI text and to
     ]),
   );
   expect(network).toHaveBeenCalledTimes(2);
+  for (const [, init] of network.mock.calls) {
+    expect(new Headers(init?.headers).get('authorization')).toBe(
+      'Bearer fixture',
+    );
+    expect(init?.redirect).toBeUndefined();
+  }
   expect(String(network.mock.calls[0][0])).toBe(
     'https://unused.invalid/v1/chat/completions',
   );
@@ -137,6 +146,94 @@ it('executes a page tool, continues with its result, and emits AG-UI text and to
       }),
     ]),
   );
+});
+
+it('passes a renewing credential through the real locked adapter on each tool-loop request', async () => {
+  const token = vi
+    .fn()
+    .mockResolvedValueOnce('first-token')
+    .mockResolvedValueOnce('second-token');
+  const f = fixture(token);
+  const network = vi
+    .spyOn(globalThis, 'fetch')
+    .mockResolvedValueOnce(
+      createPageCall({ title: 'Notes', content: '# Notes' }),
+    )
+    .mockResolvedValueOnce(
+      completion({ role: 'assistant', content: 'Created Notes.' }),
+    );
+  expect(token).not.toHaveBeenCalled();
+  const events = await lastValueFrom(f.agent.run(f.input).pipe(toArray()));
+  expect(events.some((event) => event.type === EventType.RUN_FINISHED)).toBe(
+    true,
+  );
+  expect(token).toHaveBeenCalledTimes(2);
+  expect(network).toHaveBeenCalledTimes(2);
+  expect(
+    network.mock.calls.map(([, init]) =>
+      new Headers(init?.headers).get('authorization'),
+    ),
+  ).toEqual(['Bearer first-token', 'Bearer second-token']);
+  for (const [, init] of network.mock.calls) {
+    expect(new Headers(init?.headers).get('x-stainless-package-version')).toBe(
+      '6.49.0',
+    );
+    expect(init?.redirect).toBe('error');
+  }
+});
+
+it.each(['credential', 'provider'])(
+  'does not expose or log managed-identity %s errors',
+  async (failure) => {
+    vi.stubEnv('OPENAI_LOG', 'debug');
+    const token =
+      failure === 'credential'
+        ? vi.fn().mockRejectedValue(new Error('SECRET identity details'))
+        : vi.fn().mockResolvedValue('SECRET-token');
+    const f = fixture(token);
+    const network = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      Response.json(
+        {
+          error: { message: 'SECRET model error body', code: 'SECRET-code' },
+        },
+        { status: 401 },
+      ),
+    );
+    const logs = ['log', 'warn', 'error', 'debug', 'info', 'dir'].map(
+      (method) =>
+        vi.spyOn(console, method as 'log').mockImplementation(() => {}),
+    );
+    const events = await lastValueFrom(f.agent.run(f.input).pipe(toArray()));
+    expect(events).toContainEqual({
+      type: EventType.RUN_ERROR,
+      message:
+        'OpenDots could not complete this request. Please check the app and try again.',
+    });
+    expect(JSON.stringify(events)).not.toContain('SECRET');
+    expect(JSON.stringify(logs.flatMap((log) => log.mock.calls))).not.toContain(
+      'SECRET',
+    );
+    if (failure === 'credential') expect(network).not.toHaveBeenCalled();
+  },
+);
+
+it('prevents the SDK transport from forwarding managed-identity Bearer credentials through redirects', async () => {
+  const redirect = await modelRedirect();
+  const nativeFetch = globalThis.fetch;
+  const f = fixture(async () => 'managed-token');
+  vi.spyOn(globalThis, 'fetch').mockImplementation((_url, init) =>
+    nativeFetch(redirect.url, init),
+  );
+  try {
+    const events = await lastValueFrom(f.agent.run(f.input).pipe(toArray()));
+    expect(events.some((event) => event.type === EventType.RUN_ERROR)).toBe(
+      true,
+    );
+    expect(redirect.requests.length).toBeGreaterThan(0);
+    expect(redirect.requests.every((url) => url === '/redirect')).toBe(true);
+  } finally {
+    await redirect.close();
+  }
 });
 
 it('offers the canonical review tool and waits for the client without saving a page', async () => {

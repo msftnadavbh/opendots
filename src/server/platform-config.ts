@@ -1,5 +1,6 @@
 import type { WebConfig } from './parallel.js';
 import type { SetupStatus } from '../shared/types.js';
+import type { ModelCredential } from './model-auth.js';
 
 // `copilotkit project select` writes the CLI name and deletes the template name.
 const INTELLIGENCE_API_KEY_ENV_NAMES = [
@@ -54,7 +55,7 @@ export interface PlatformConfig extends WebConfig {
   intelligenceApiUrl?: string;
   intelligenceWsUrl?: string;
   model?: string;
-  apiKey?: string;
+  apiKey?: ModelCredential;
   baseUrl: string;
   agentRunTimeoutMs?: number;
   computerSupervisorUrl?: string;

@@ -4,6 +4,7 @@ import {
   research,
   type Config,
 } from '../src/server/research.js';
+import { modelRedirect } from './fixtures/model-redirect.js';
 const signal = new AbortController().signal;
 const config: Config = {
   mode: 'live',
@@ -63,9 +64,146 @@ describe('research adapters', () => {
     );
     expect(result.text).toBe('A grounded brief.');
     expect(result.sample).toBe(false);
+    expect(fetch.mock.calls[1][1].headers.Authorization).toBe('Bearer secret');
+    expect(fetch.mock.calls[1][1].redirect).toBe('error');
+    expect(fetch.mock.calls[1][1].signal).toBe(signal);
     expect(
       JSON.parse(fetch.mock.calls[1][1].body).messages[1].content,
     ).toContain('Verified source text');
+  });
+  it('resolves the model credential immediately before every research request', async () => {
+    const order: string[] = [];
+    let generation = 0;
+    const token = vi.fn(async () => {
+      order.push('auth');
+      return `token-${++generation}`;
+    });
+    const network = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.endsWith('/browse')) {
+        order.push('browser');
+        return Response.json({
+          title: 'Page',
+          url: 'https://example.com',
+          text: 'Evidence',
+        });
+      }
+      order.push('model');
+      expect(new Headers(init.headers).get('authorization')).toBe(
+        `Bearer token-${generation}`,
+      );
+      expect(init.signal).toBe(signal);
+      expect(init.redirect).toBe('error');
+      return Response.json({ choices: [{ message: { content: 'Brief' } }] });
+    });
+    vi.stubGlobal('fetch', network);
+    expect(token).not.toHaveBeenCalled();
+    for (let i = 0; i < 2; i++) {
+      await research(
+        'Read https://example.com',
+        [],
+        { ...config, apiKey: token },
+        signal,
+        () => {},
+      );
+    }
+    expect(order).toEqual([
+      'browser',
+      'auth',
+      'model',
+      'browser',
+      'auth',
+      'model',
+    ]);
+    expect(token).toHaveBeenCalledTimes(2);
+  });
+  it.each(['before research', 'before auth', 'during auth'])(
+    'does not send a model request after cancellation %s',
+    async (when) => {
+      const controller = new AbortController();
+      const token = vi.fn(async () => {
+        if (when === 'during auth') {
+          await Promise.resolve();
+          controller.abort();
+        }
+        return 'must-not-be-sent';
+      });
+      const network = vi.fn(async () => {
+        if (when === 'before auth') controller.abort();
+        return Response.json({
+          title: 'Page',
+          url: 'https://example.com',
+          text: 'Evidence',
+        });
+      });
+      vi.stubGlobal('fetch', network);
+      if (when === 'before research') controller.abort();
+      const error = await research(
+        'Read https://example.com',
+        [],
+        { ...config, apiKey: token },
+        controller.signal,
+        () => {},
+      ).catch((error: unknown) => error);
+      expect(controller.signal.aborted).toBe(true);
+      expect(error).toBe(controller.signal.reason);
+      expect(network).toHaveBeenCalledTimes(when === 'before research' ? 0 : 1);
+      expect(token).toHaveBeenCalledTimes(when === 'during auth' ? 1 : 0);
+    },
+  );
+  it('does not request a completion when model authentication fails', async () => {
+    const token = vi
+      .fn()
+      .mockRejectedValue(
+        new Error('Managed identity model authentication failed.'),
+      );
+    const network = vi.fn().mockResolvedValue(
+      Response.json({
+        title: 'Page',
+        url: 'https://example.com',
+        text: 'Evidence',
+      }),
+    );
+    vi.stubGlobal('fetch', network);
+    await expect(
+      research(
+        'Read https://example.com',
+        [],
+        { ...config, apiKey: token },
+        signal,
+        () => {},
+      ),
+    ).rejects.toThrow('Managed identity model authentication failed.');
+    expect(network).toHaveBeenCalledTimes(1);
+  });
+  it('blocks real HTTP redirects from the raw model request', async () => {
+    const redirect = await modelRedirect();
+    const nativeFetch = globalThis.fetch;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init: RequestInit) => {
+        if (url.endsWith('/browse'))
+          return Response.json({
+            title: 'Page',
+            url: 'https://example.com',
+            text: 'Evidence',
+          });
+        return nativeFetch(redirect.url, init);
+      }),
+    );
+    try {
+      await expect(
+        research(
+          'Read https://example.com',
+          [],
+          { ...config, apiKey: async () => 'managed-token' },
+          signal,
+          () => {},
+        ),
+      ).rejects.toThrow();
+      expect(redirect.requests).toEqual(['/redirect']);
+    } finally {
+      await redirect.close();
+    }
   });
   it('surfaces browser and model failures without presenting success', async () => {
     vi.stubGlobal(

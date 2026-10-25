@@ -2,6 +2,7 @@ export function createShutdown(options: {
   stopRunner: () => void;
   stopPlatform: () => Promise<void>;
   closeServer: () => Promise<void>;
+  flushTelemetry?: () => Promise<void>;
   exit: (code: number) => void;
   report: (operation: string, error: unknown) => void;
   timeoutMs?: number;
@@ -37,7 +38,14 @@ export function createShutdown(options: {
         Promise.all([
           settle('Stopping Channels failed', options.stopPlatform),
           settle('Closing HTTP server failed', options.closeServer),
-        ]),
+        ]).then(() =>
+          options.flushTelemetry
+            ? settle(
+                'Flushing runtime telemetry failed',
+                options.flushTelemetry,
+              )
+            : undefined,
+        ),
         deadline,
       ]);
       clearTimeout(timer);

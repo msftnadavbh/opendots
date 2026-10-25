@@ -33,7 +33,7 @@ import {
 } from './ComputerToolCard';
 import { ChatTranscript, isInternalVoiceReceipt } from './ChatTranscript';
 import type { CallReceipt, Conversation, Dot } from '../shared/types';
-import { Mascot } from './Mascot';
+import { DotAvatar } from './DotAvatar';
 import { useVoice } from './useVoice';
 import { CallView } from './CallView';
 import { shouldSubmitComposerOnKeyDown } from './chat-composer';
@@ -261,9 +261,8 @@ export function Chat({
   return (
     <div className="live-chat">
       <header className="chat-persona">
-        <Mascot
-          identity={dot.id}
-          name={dot.name}
+        <DotAvatar
+          dot={dot}
           small
           state={running ? 'working' : paused ? 'paused' : 'idle'}
         />

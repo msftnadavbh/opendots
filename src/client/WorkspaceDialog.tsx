@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import type { Dot, Memory, State, WorkspaceState } from '../shared/types';
 import { ConnectionsSection } from './ConnectionsSection';
+import { DotPhotoSettings } from './DotPhotoSettings';
 import {
   setThemePreference,
   themePreference,
@@ -19,12 +20,14 @@ export function WorkspaceDialog({
   workspace,
   onClose,
   mutate,
+  onPhotoSaved,
 }: {
   dialog: Dialog;
   state: State;
   workspace: WorkspaceState;
   onClose: () => void;
   mutate: (path: string, method: string, body?: unknown) => Promise<boolean>;
+  onPhotoSaved: () => Promise<void>;
 }) {
   const [name, setName] = useState(
     dialog.type === 'dot' ? (dialog.dot?.name ?? '') : '',
@@ -86,7 +89,7 @@ export function WorkspaceDialog({
       if (event.key === 'Tab') {
         const items = [
           ...(container.current?.querySelectorAll<HTMLElement>(
-            'button:not([disabled]),input,textarea,select,a[href]',
+            'button:enabled,input:enabled,textarea:enabled,select:enabled,a[href]',
           ) ?? []),
         ];
         if (event.shiftKey && document.activeElement === items[0]) {
@@ -235,6 +238,15 @@ export function WorkspaceDialog({
                 }
               />
             </>
+          )}
+          {dialog.type === 'dot' && dialog.dot && (
+            <DotPhotoSettings
+              dot={
+                workspace.dots.find((dot) => dot.id === dialog.dot?.id) ??
+                dialog.dot
+              }
+              onSaved={onPhotoSaved}
+            />
           )}
           {dialog.type === 'dot' && (
             <fieldset className="space-access-fields">

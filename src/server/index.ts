@@ -1,5 +1,6 @@
 import { webSearchProvider } from './parallel.js';
 import { createShutdown } from './shutdown.js';
+import { initializeRuntimeTelemetry } from './runtime-telemetry.js';
 import { reportChannelFailure, safeFailure } from './slack-channel.js';
 import { serve } from '@hono/node-server';
 import { serveStatic } from '@hono/node-server/serve-static';
@@ -9,6 +10,7 @@ import { createApp } from './app.js';
 import { resolveAppOrigins } from './app-origin.js';
 import { WorkspaceStore } from './workspace.js';
 import { Platform } from './platform.js';
+import { modelCredentialFromEnv } from './model-auth.js';
 import {
   agentRunTimeoutMsFromEnv,
   intelligenceApiKeyFromEnv,
@@ -16,6 +18,10 @@ import {
   type PlatformConfig,
 } from './platform-config.js';
 const host = process.env.HOST ?? '127.0.0.1';
+const flushTelemetry = await initializeRuntimeTelemetry(
+  process.env.APPLICATIONINSIGHTS_CONNECTION_STRING,
+);
+let shuttingDown = false;
 const port = Number(process.env.PORT ?? 4310);
 const ownerToken = process.env.OWNER_TOKEN;
 if (
@@ -35,7 +41,7 @@ const config: PlatformConfig = {
   intelligenceKey: intelligenceApiKeyFromEnv(process.env),
   intelligenceApiUrl: process.env.INTELLIGENCE_API_URL || undefined,
   intelligenceWsUrl: intelligenceWsUrlFromEnv(process.env),
-  apiKey: process.env.OPENAI_API_KEY,
+  apiKey: modelCredentialFromEnv(process.env),
   model: process.env.OPENAI_MODEL,
   baseUrl: process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1',
   agentRunTimeoutMs: agentRunTimeoutMsFromEnv(process.env),
@@ -96,9 +102,11 @@ const app = createApp({
   store,
   runner,
   config: researchConfig,
+  databasePath: database,
   ownerToken,
   origin: resolveAppOrigins(process.env.APP_ORIGIN, process.env.NODE_ENV),
   platform,
+  isReady: () => !shuttingDown,
 });
 app.use('*', async (c, next) => {
   c.header('X-Content-Type-Options', 'nosniff');
@@ -125,7 +133,11 @@ const server = serve({ fetch: app.fetch, hostname: host, port }, (info) => {
     );
 });
 const shutdown = createShutdown({
-  stopRunner: () => runner.stop(),
+  stopRunner: () => {
+    shuttingDown = true;
+    runner.stop();
+  },
+  flushTelemetry,
   stopPlatform: () => platform.stop(),
   closeServer: () =>
     new Promise<void>((resolve, reject) =>

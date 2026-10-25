@@ -149,6 +149,28 @@ it('aborts an active turn when connected-app permission is revoked', async () =>
   }
 });
 
+it('does not abort an active turn when only its photo changes', async () => {
+  vi.useFakeTimers();
+  try {
+    const f = fixture(false);
+    inner.abortRun.mockClear();
+    inner.run.mockReturnValue(new Subject<BaseEvent>());
+    const subscription = f.agent.run(f.input).subscribe();
+    await vi.advanceTimersByTimeAsync(0);
+    const id = f.workspace.dots()[0].id;
+    f.workspace.saveDotPhoto(id, Buffer.from('fixture'));
+    await vi.advanceTimersByTimeAsync(100);
+    f.workspace.saveDotPhoto(id, Buffer.from('replacement'));
+    await vi.advanceTimersByTimeAsync(100);
+    f.workspace.deleteDotPhoto(id);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(inner.abortRun).not.toHaveBeenCalled();
+    subscription.unsubscribe();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it('replaces channel RUN_ERROR payload entirely before the SDK renderer sees it', async () => {
   const f = fixture();
   inner.run.mockReturnValue(

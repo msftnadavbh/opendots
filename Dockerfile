@@ -11,6 +11,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev && mkdir -p /data && chown node:node /data
 COPY --from=build /app/dist ./dist
+COPY deployment/azure/scope.mjs deployment/azure/runtime-env.mjs deployment/azure/start.mjs deployment/azure/sqlite-backup.mjs deployment/azure/vm-files.mjs ./deployment/azure/
+COPY deployment/azure/export-backup.mjs deployment/azure/export-guardian.sh ./deployment/azure/
 USER node
 EXPOSE 4310
 CMD ["node", "dist/server/server/index.js"]

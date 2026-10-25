@@ -1,0 +1,15 @@
+{
+  "name": "opendots-pilot-operator",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.23.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.check.mjs"
+  },
+  "dependencies": {
+    "@azure/containerapps-sandbox": "1.0.0-beta.1",
+    "@azure/identity": "4.14.0"
+  }
+}

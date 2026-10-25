@@ -37,7 +37,7 @@ The SDK sends existing runtime events to
 (`1`), and Docker Compose uses the same default. An explicit
 `COPILOTKIT_TELEMETRY_SAMPLE_RATE` override is respected.
 
-Remove old deployment settings that disable telemetry if tracking is desired.
+CopilotKit runtime and browser setup telemetry are enabled by default.
 To opt out, set either `COPILOTKIT_TELEMETRY_DISABLED=true` or `DO_NOT_TRACK=1`
 and restart the API. Both variables accept `true` or `1`. The `npm test` command disables telemetry for ordinary automated fixtures.
 
@@ -61,8 +61,9 @@ OpenDots does not emit a duplicate signup event on startup, login or key entry.
 
 ## Validate in PostHog
 
-After deploying, restart the API and make one chat request. In
-[PostHog project 26816](https://eu.posthog.com/project/26816), run:
+Delivery and account attribution require access to the telemetry recipient's
+PostHog reporting environment; running OpenDots does not grant that access.
+With authorization, restart the API, make one chat request, and run:
 
 ```sql
 SELECT event, timestamp, distinct_id,
@@ -94,9 +95,9 @@ uses the same identity lookup. Both queries exclude marked validation events
 from requests and identity lookups.
 
 An HTTP `202` from ingest alone does not prove PostHog delivery. If the event
-or identity enrichment is missing, check the deployed server environment and
-the `TelemetrySinkIngest` / `TelemetrySinkFanout` CloudWatch logs. The canonical
-reporting surface is [dashboard 664553](https://eu.posthog.com/project/26816/dashboard/664553).
+or identity enrichment is missing, check the deployed server configuration without
+printing credentials, then ask the telemetry service owner to inspect ingestion
+and identity resolution. Do not infer downstream delivery from local tests.
 
 ## Local verification
 
@@ -104,59 +105,59 @@ reporting surface is [dashboard 664553](https://eu.posthog.com/project/26816/das
 tests start fresh processes, intercept SDK fetch calls before importing it,
 and check the OpenDots tag, CLI-issued identity header, full sampling, explicit
 sampling override, both opt-outs and absence of the project key in the payload.
-These checks prove the local SDK contract; production delivery and identity
-resolution require the PostHog checks above. Internal `@copilotkit.ai` accounts
-are excluded from signup sync, so validate a new external signup separately.
+These checks cover the local SDK contract; production delivery and identity
+resolution require the PostHog checks above. Validate a new external signup
+separately rather than inferring it from an existing account's runtime event.
 
 Ask the reporting owner to add the OpenDots filter and Clerk-ID join to
 its reporting rule. The query counts signup accounts associated with usage,
 not signups caused by the template. Local Intelligence evaluation also requires
 CopilotKit sign-in, but a runtime event by itself does not establish a new signup.
 
-## Reporting queries and validation evidence
+## Reporting queries and setup identity
 
 The saved [signup-account query](telemetry/opendots-signups.hogql.sql) and
 [daily usage query](telemetry/opendots-usage.hogql.sql) exclude marked validation
 probes. The [setup-event query](telemetry/opendots-setup.hogql.sql) and
 [installation conversion query](telemetry/opendots-setup-conversion.hogql.sql)
-report the [browser setup flow](SETUP-TELEMETRY.md). All four queries executed
-successfully against the production PostHog query API. Use these as the OpenDots
-reporting rule in PostHog. Request counts are
-attempts, including requests rejected by the SDK; they are not successful answers.
+report the [browser setup flow](SETUP-TELEMETRY.md). Request counts are attempts,
+including requests rejected by the SDK; they are not successful answers. Validate
+queries and reporting permissions in the recipient's environment before relying
+on a report.
 
-On October 5, 2026, a live SDK probe using the CLI-selected `opendots` project
-sent `oss.runtime.instance_created` and `oss.runtime.copilot_request_created`
-to the production sink. Both returned HTTP `202` with marker
-`opendots-validation-be790d6a-ff3e-4ce9-be30-5e3741ffc707`. The request was stopped
-at SDK body validation before an agent ran. It made no model call and created
-no signup or customer conversation.
+Setup events do not receive Clerk account enrichment from the shared fanout;
+only the two exact runtime event types above do. Join setup and runtime by their
+shared `installation_id` to associate setup with account-resolved usage. The
+runtime continues to use the CLI identity as its transport identity when present;
+otherwise it uses the persistent random installation identity. See
+[Browser setup telemetry](SETUP-TELEMETRY.md) for collected metadata, queue retention,
+and opt-out cleanup.
 
-Authenticated PostHog queries returned one event of each type, both with a
-telemetry identity and resolved Clerk user ID. Both events resolved to a staff
-account (`@copilotkit.ai`), which signup sync excludes; the matching signup
-count was therefore zero. This proves live SDK delivery and account resolution,
-not a new external signup. The saved reporting queries both executed successfully:
-zero signup accounts and no non-validation daily usage rows at validation time.
+A request can retain telemetry identity without Clerk enrichment. The reporting
+queries therefore use the same-identity startup lookup. A missing request Clerk
+ID alone is not evidence that OpenDots lost its identity. The shared sink's
+identity resolution is separate from this application's transport wiring.
 
-The validation key is permitted to execute HogQL but cannot read dashboard
-664553 (`403`, missing `dashboard:read`). The queries are prepared and executed,
-but were not saved as dashboard charts. Saving the reporting rule requires
-dashboard and insight read/write scopes, or the reporting owner's intervention.
+## Optional Azure Monitor spans
 
-A marked `oss.runtime.setup_step_viewed` from the production setup emitter also
-reached PostHog with its installation UUID:
-`opendots-setup-validation-1ddf8b49-4d6a-434e-b345-4982d48cd9a5`. Setup events
-do not receive Clerk account enrichment from the shared fanout; only the two
-exact runtime event types above do. Join setup and runtime by their shared
-`installation_id` to associate setup with account-resolved usage. The runtime
-continues to use the CLI identity as its transport identity. Activation and
-abandonment edge cases are validated locally, not fabricated in production.
+Setting `APPLICATIONINSIGHTS_CONNECTION_STRING` enables a separate Azure Monitor
+trace exporter. It sends `agent.turn` spans to the configured Application Insights
+destination with channel and outcome attributes and service name `opendots-pilot`.
+These application spans do not collect prompts, answers, tool payloads, HTTP
+request logs, or credentials. Offline exporter storage is disabled.
 
-The combined updated probe
-`opendots-validation-70c8067c-aa54-48c5-8d37-725baca262cf` delivered a startup,
-request, and setup-view event with one shared installation UUID. Startup
-resolved to the Clerk account; the request retained telemetry identity but
-lacked Clerk enrichment. This is why reporting uses the same-identity startup
-lookup. A missing request Clerk ID alone is not evidence that the template
-lost its identity. The shared sink's dependency resolution is separate from
-this template's transport wiring.
+The pinned exporter (`1.0.0-beta.46`) also sends Statsbeat to Microsoft's separate
+diagnostic store, including resource identifiers, OS/runtime and SDK versions,
+and ingestion endpoint health metadata. Customer SDK-stats metrics (telemetry
+success/drop/retry counts) go to the configured Application Insights destination.
+The SDK also polls remote settings at `https://settings.sdk.monitor.azure.com`,
+with an hourly refresh by default; the service and error backoff can adjust it.
+
+For this version, `APPLICATION_INSIGHTS_NO_STATSBEAT=1` disables Statsbeat and
+SDK-stats metrics; `APPLICATIONINSIGHTS_SDKSTATS_DISABLED=true` disables SDK-stats
+metrics alone. Neither flag stops remote-settings polling. Restart after changes.
+
+This exporter is independent of CopilotKit telemetry: `DO_NOT_TRACK` and
+`COPILOTKIT_TELEMETRY_DISABLED` do not control it. Leave
+`APPLICATIONINSIGHTS_CONNECTION_STRING` unset and restart to avoid exporter
+initialization and all of its spans, SDK diagnostics, and settings traffic.
