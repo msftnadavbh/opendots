@@ -184,7 +184,60 @@ export function assertManagedHandler(resource, ready = false) {
   };
 }
 
-async function submissionReady(az, client, state, existing, signal) {
+const nativeVersions = Object.freeze({
+  'Microsoft.CPlat.Core.RunCommandHandlerLinux': '1.3.28',
+  'Microsoft.CPlat.Core.LinuxPatchExtension': '1.6.71',
+  'Microsoft.CPlat.Core.RunCommandLinux': '1.0.12',
+});
+const managedNativeType = `${RUN_COMMAND.publisher}.${RUN_COMMAND.handlerType}`;
+const ready = (status) =>
+  status?.code === 'ProvisioningState/succeeded' &&
+  status.level === 'Info' &&
+  status.displayStatus === 'Ready';
+const succeeded = (statuses) =>
+  Array.isArray(statuses) &&
+  statuses.length === 1 &&
+  statuses[0]?.code === 'ProvisioningState/succeeded' &&
+  statuses[0].level === 'Info';
+
+function explicitIdentity(resource, type) {
+  if (type === RUN_COMMAND.handlerType) assertManagedHandler(resource);
+  const p = resource?.properties;
+  requirePilot(
+    resource?.id?.toLowerCase() ===
+      `${VM.ids.id}/extensions/${type}`.toLowerCase() &&
+      resource.type?.toLowerCase() ===
+        'microsoft.compute/virtualmachines/extensions' &&
+      resource.location?.toLowerCase() === SCOPE.location &&
+      p?.publisher === RUN_COMMAND.publisher &&
+      p.type === type &&
+      /^\d+\.\d+(?:\.\d+){0,2}$/.test(p.typeHandlerVersion ?? '') &&
+      p.provisioningState === 'Succeeded',
+    'Explicit VM extension identity/configuration is unknown, failed or transitional.',
+  );
+  return {
+    id: `${VM.ids.id}/extensions/${type}`,
+    publisher: p.publisher,
+    type: p.type,
+    configuredVersion: p.typeHandlerVersion,
+  };
+}
+
+function explicitRuntime(view, native) {
+  requirePilot(
+    native &&
+      view?.typeHandlerVersion === native.typeHandlerVersion &&
+      succeeded(view.statuses),
+    'Explicit VM extension runtime/readiness contradicts the recognized native handler.',
+  );
+  return {
+    runtimeVersion: view.typeHandlerVersion,
+    status: { code: view.statuses[0].code, level: view.statuses[0].level },
+  };
+}
+
+// The four trust gates use the same raw REST discovery, never a synthesized ARM extension.
+async function discoverHandler(az, client, state, existing, signal) {
   const options = { signal, timeoutMs: 30_000 };
   signal.throwIfAborted();
   await az.verify(options);
@@ -209,7 +262,8 @@ async function submissionReady(az, client, state, existing, signal) {
     items.filter((item) => item.code?.startsWith(prefix)).length === 1 &&
     items.some((item) => item.code === expected);
   requirePilot(
-    p?.vmId === state.binding.vmUniqueId &&
+    vm.type?.toLowerCase() === 'microsoft.compute/virtualmachines' &&
+      p?.vmId === state.binding.vmUniqueId &&
       vm.identity?.type === 'SystemAssigned' &&
       vm.identity.tenantId === state.binding.tenantId &&
       vm.identity.principalId === state.binding.principalId &&
@@ -241,6 +295,33 @@ async function submissionReady(az, client, state, existing, signal) {
     different === -1 || version[different] > minimum[different],
     'Guest agent is older than the supported managed Run Command minimum 2.4.0.2.',
   );
+  requirePilot(
+    Array.isArray(agent.extensionHandlers) &&
+      agent.extensionHandlers.length <= 3,
+    'Complete native vmAgent.extensionHandlers evidence is missing; absence is not an empty collection.',
+  );
+  const natives = new Map();
+  for (const handler of agent.extensionHandlers) {
+    requirePilot(
+      handler &&
+        Object.hasOwn(nativeVersions, handler.type) &&
+        handler.typeHandlerVersion === nativeVersions[handler.type] &&
+        ready(handler.status) &&
+        !natives.has(handler.type),
+      'Native handler changed, duplicated, unsupported or not Ready; stop for exact handler review.',
+    );
+    natives.set(handler.type, handler);
+  }
+  const managed = natives.get(managedNativeType);
+  requirePilot(
+    managed ||
+      (!existing &&
+        !state.management?.pending &&
+        !state.management?.receipt &&
+        !state.management?.canary &&
+        !state.management?.privacyValidation),
+    'Previously tracked native managed handler is missing; refusing recreation or first-use reclassification.',
+  );
   const inventory = await az.read(
     [
       'rest',
@@ -255,51 +336,42 @@ async function submissionReady(az, client, state, existing, signal) {
     Array.isArray(inventory?.value) &&
       inventory.nextLink == null &&
       inventory.value.length <= 2 &&
-      new Set(inventory.value.map((item) => item.id?.toLowerCase())).size ===
+      new Set(inventory.value.map((item) => item?.id?.toLowerCase())).size ===
         inventory.value.length,
     'Complete bounded VM extension inventory is unavailable; an error or partial page is not an empty inventory.',
   );
-  let managed = false;
+  const managedArm = await client.handler(signal);
+  const listedManaged = inventory.value.find(
+    (item) => item?.id?.toLowerCase() === RUN_COMMAND.handlerId.toLowerCase(),
+  );
+  requirePilot(
+    (managedArm !== undefined) === !!listedManaged,
+    'Explicit managed extension list/GET presence contradicts; a 404 is only absence at that ARM path.',
+  );
+  let armExtension = { presence: 'absent' };
   for (const extension of inventory.value) {
-    const id = extension.id?.toLowerCase();
+    const id = extension?.id?.toLowerCase();
+    const type =
+      id === RUN_COMMAND.handlerId.toLowerCase()
+        ? RUN_COMMAND.handlerType
+        : 'RunCommandLinux';
     requirePilot(
-      extension.properties?.provisioningState === 'Succeeded',
-      'A VM extension is failed, transitional or unknown; no new managed submission.',
+      id === `${VM.ids.id}/extensions/${type}`.toLowerCase(),
+      'Unexpected explicit VM extension; native handler recognition does not authorize ARM adoption.',
     );
-    if (id === RUN_COMMAND.handlerId.toLowerCase()) {
+    const configured = explicitIdentity(extension, type);
+    const native = natives.get(`${configured.publisher}.${type}`);
+    if (Object.hasOwn(extension.properties, 'instanceView'))
+      explicitRuntime(extension.properties.instanceView, native);
+    let observed;
+    if (type === RUN_COMMAND.handlerType) {
       requirePilot(
         existing && state.management?.receipt,
         'Untracked managed handler; refusing first-use adoption.',
       );
-      const configured = assertManagedHandler(extension);
-      const observed = await client.handler(signal);
-      const running = assertManagedHandler(observed, true);
-      requirePilot(
-        configured.configuredVersion === running.configuredVersion &&
-          observed.properties.instanceView.statuses?.length === 1 &&
-          observed.properties.instanceView.statuses[0].level === 'Info' &&
-          status(
-            observed.properties.instanceView.statuses,
-            'ProvisioningState/',
-            'ProvisioningState/succeeded',
-          ),
-        'Managed handler changed or has conflicting readiness during inspection.',
-      );
-      managed = true;
+      observed = managedArm;
     } else {
-      requirePilot(
-        id === `${VM.ids.id}/extensions/RunCommandLinux`.toLowerCase() &&
-          extension.type?.toLowerCase() ===
-            'microsoft.compute/virtualmachines/extensions' &&
-          extension.location?.toLowerCase() === SCOPE.location &&
-          extension.properties.publisher === 'Microsoft.CPlat.Core' &&
-          extension.properties.type === 'RunCommandLinux' &&
-          /^\d+\.\d+(?:\.\d+){0,2}$/.test(
-            extension.properties.typeHandlerVersion ?? '',
-          ),
-        'Unexpected VM extension; no new managed submission.',
-      );
-      const observed = await az.read(
+      observed = await az.read(
         [
           'rest',
           '--method',
@@ -309,35 +381,59 @@ async function submissionReady(az, client, state, existing, signal) {
         ],
         options,
       );
-      requirePilot(
-        observed?.id?.toLowerCase() === id &&
-          observed.type === extension.type &&
-          observed.location === extension.location &&
-          observed.properties?.publisher === extension.properties.publisher &&
-          observed.properties.type === extension.properties.type &&
-          observed.properties.typeHandlerVersion ===
-            extension.properties.typeHandlerVersion &&
-          observed.properties.provisioningState === 'Succeeded' &&
-          observed.properties.instanceView?.statuses?.length === 1 &&
-          observed.properties.instanceView.statuses[0].level === 'Info' &&
-          status(
-            observed.properties.instanceView?.statuses,
-            'ProvisioningState/',
-            'ProvisioningState/succeeded',
-          ),
-        'Historical action handler readiness is unavailable; no new managed submission.',
-      );
     }
+    requirePilot(
+      isDeepStrictEqual(explicitIdentity(observed, type), configured),
+      'Explicit VM extension list/GET configuration changed during discovery.',
+    );
+    const runtime = explicitRuntime(observed.properties.instanceView, native);
+    if (type === RUN_COMMAND.handlerType)
+      armExtension = { presence: 'present', ...configured, ...runtime };
   }
-  requirePilot(
-    managed ||
-      (!existing &&
-        !state.management?.receipt &&
-        !state.management?.canary &&
-        !state.management?.privacyValidation),
-    'Previously tracked managed handler is missing; refusing recreation.',
-  );
+  if (Object.hasOwn(view, 'extensions')) {
+    requirePilot(
+      Array.isArray(view.extensions) &&
+        view.extensions.length <= 3 &&
+        new Set(view.extensions.map((item) => item?.name)).size ===
+          view.extensions.length,
+      'Top-level instanceView.extensions is malformed or duplicated.',
+    );
+    for (const item of view.extensions) {
+      const native = natives.get(item?.type);
+      requirePilot(
+        native &&
+          item.name === item.type.slice(RUN_COMMAND.publisher.length + 1),
+        'Top-level extension identity contradicts the native inventory.',
+      );
+      explicitRuntime(item, native);
+    }
+    requirePilot(
+      inventory.value.every((item) =>
+        view.extensions.some(
+          (entry) =>
+            entry.name === item.properties.type &&
+            entry.type ===
+              `${item.properties.publisher}.${item.properties.type}`,
+        ),
+      ),
+      'Top-level extension view dropped an explicitly configured extension.',
+    );
+  }
   signal.throwIfAborted();
+  if (!managed) return; // Only genuine first use may lack the native managed runtime.
+  return {
+    kind: 'vmAgent.extensionHandlers',
+    vmId: VM.ids.id,
+    vmUniqueId: p.vmId,
+    type: managed.type,
+    runtimeVersion: managed.typeHandlerVersion,
+    status: {
+      code: managed.status.code,
+      level: managed.status.level,
+      displayStatus: managed.status.displayStatus,
+    },
+    armExtension,
+  };
 }
 
 function assertOperation(operation) {
@@ -575,6 +671,11 @@ function assertPrivacyProof(proof, candidate, state) {
     candidate &&
       candidate.transportSha256 === TRANSPORT_SHA256 &&
       candidate.vmUniqueId === state.binding.vmUniqueId &&
+      candidate.handler?.kind === 'vmAgent.extensionHandlers' &&
+      candidate.handler.vmId === VM.ids.id &&
+      candidate.handler.vmUniqueId === state.binding.vmUniqueId &&
+      candidate.handler.type === managedNativeType &&
+      candidate.handler.runtimeVersion === nativeVersions[managedNativeType] &&
       uuid.test(candidate.operationId) &&
       sha.test(candidate.sourceSha256) &&
       exactKeys(proof, [
@@ -663,8 +764,17 @@ export function managedTransport({
       busy = false;
     }
   };
-  const handler = async (operationSignal) =>
-    assertManagedHandler(await client.handler(operationSignal), true);
+  const handler = async (operationSignal) => {
+    const m = current();
+    requirePilot(
+      !m.pending && m.receipt,
+      'Handler qualification requires a reconciled managed receipt.',
+    );
+    const existing = await client.get(operationSignal);
+    assertManagedCommand(existing, m.receipt);
+    assertPriorCompletion(existing, m.receipt, binding);
+    return discoverHandler(az, client, state, existing, operationSignal);
+  };
   const requirePrivacy = async (operationSignal = signal) => {
     const m = current(),
       proof = m.privacyValidation;
@@ -845,7 +955,7 @@ export function managedTransport({
         ...(spec.disk ? { disk: spec.disk } : {}),
         ...(recovery ? { recovery } : {}),
       };
-      await submissionReady(az, client, state, existing, deadline);
+      await discoverHandler(az, client, state, existing, deadline);
       const next = { ...m, pending: operation };
       if (canary) {
         delete next.privacyValidation;
@@ -958,7 +1068,10 @@ export function managedTransport({
           'Privacy inspection completion changed; proof cannot be recorded.',
         );
         requirePilot(
-          isDeepStrictEqual(await handler(deadline), candidate.handler),
+          isDeepStrictEqual(
+            await discoverHandler(az, client, state, resource, deadline),
+            candidate.handler,
+          ),
           'Handler drift since canary.',
         );
         await persist({ ...m, privacyValidation: structuredClone(proof) });

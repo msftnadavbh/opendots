@@ -7,8 +7,9 @@ and the integrated application backup API/HTTPS client must pass their gates bef
 Live privacy inspection and Azure validation remain lead-owned. Local tests do not establish
 cloud readiness. This runbook is not authorization for cloud operations.
 
-The latest lead handoff reports the original VM running after a separately reviewed power start;
-guest eligibility is still unknown. Do not change tags/schedules or run a restart loop.
+The latest lead handoff reports the original VM **deallocated**, with its original identity intact;
+guest eligibility is still unknown. This transport fix authorizes no power start or regional migration.
+Do not change tags/schedules or run a restart loop.
 This document and local fixture results are not live authorization or acceptance evidence.
 
 The recorded drift includes both original disks at `Standard_LRS`, absent data-disk tags, and
@@ -157,18 +158,28 @@ mounts, repairs, reloads, configures or pulls. They expose only the existing emp
 never logs, runtime.env, database contents or config contents. Failure is a stop/diagnostic finding, not an absence
 or permission to repair. These diagnostics do not grant recovery or activation eligibility.
 
-**First-use order is a live gate, not a fixture assumption.** Before the first agent-backed submission, the lead
-must freshly record the first-use basis: no prior management/pending/receipt/canary/privacy approval, a404 for the
-fixed managed child, the bound running/Succeeded VM with supported Ready agent, and the complete empty extension
-inventory. The current handoff reports no management field, child404, Ready2.16.0.2 and no extensions; retain the
-actual evidence and current state hash, not a permanent requirement to match the initial whole-state hash.
+**First-use order is a live gate, not a fixture assumption.** Before a genuinely first agent-backed submission,
+the lead must freshly record the absence of a prior managed child/pending/receipt/candidate/privacy approval,
+the bound running/Succeeded VM with supported Ready agent, its complete native handler collection and the
+independent explicit ARM extension inventory/managed-extension GET. Recognized Ready native handlers may already
+exist; they are not ARM resources to adopt. Missing native metadata is not an empty collection. The native list
+before the original VM's first canary was not captured: do not infer that it was empty.
 
 Make `management-canary` the first submission and **do not chain another guest command**. After that submission,
-the lead must read the actual extension collection, the exact handler GET **with instanceView**, and the canary's
+the lead must read VM GET **with instanceView**, its native `vmAgent.extensionHandlers`, the complete explicit
+extension collection, the exact managed ARM extension GET **with instanceView**, and the canary's
 managed-child GET **with and without instanceView**, before any reuse. Reconcile an unknown pending result with
 GET only. Unexpected fields, versions, status shapes or missing evidence require lead/architect consultation;
 do not blindly edit fixtures, coerce a response or widen the handler gate. Fixture success does not prove the
 live handler format. The canary's own handler lookup is not a substitute for this independent inspection.
+
+The first live nonsecret canary actually completed successfully (operation
+`4d9396c2-acbb-4bb9-a3b3-2b17020659c6`, category `ok`, exit0); its receipt was saved and pending cleared.
+Only subsequent handler qualification failed: the exact ARM extension GET returned404, while the agent reported
+the native managed handler Ready. No candidate/privacy approval was recorded and no real credentials were sent.
+Preserve that receipt and its recorded transport/source hashes; do not clear, rewrite, migrate or replay it.
+This hashed transport fix requires a **new deliberate canary with a new operation ID**, after review and separate
+running-window authorization. Old API-side captures are not approval for the changed transport or guest privacy.
 
 Only after those first-submission surfaces are preserved and verified may these fixed nonsecret probes reuse
 the child:
@@ -196,6 +207,8 @@ transport version/hash and operation ID. It is reused, never deleted. The closed
 tracked child and the exact `Microsoft.CPlat.Core/RunCommandHandlerLinux` handler on this VM.
 The historical action `RunCommandLinux` allowance is retained, but the operator no longer invokes it.
 An untracked child, different source/operation, wrong handler/publisher/version or foreign resource stops work.
+These ARM allowances are separate from native agent reports. Recognizing native `LinuxPatchExtension` grants
+no explicit ARM extension allowance, installation/removal permission or closed-inventory exception.
 
 The logged-in Azure **user** is rechecked against the fixed tenant/subscription/principal. PUT/GET use only
 the fixed ARM HTTPS origin/path and stable API `2026-04-01`; redirects and debug logging are prohibited.
@@ -213,13 +226,37 @@ An abort before intent/invalidation leaves prior state unchanged. Once a new can
 restoration never resurrects the old candidate/privacy approval. A failed restoration save poisons the transport:
 reload persistent state. After a crash, old/missing remote state is **not** proof of nondispatch.
 
-Every **new** command/canary submission has a mandatory fresh readiness check in the shared transport, under its
-operation deadline, before intent publication or durable canary invalidation. It rechecks the exact bound VM and
-principal, running/Succeeded state, Ready agent and the documented minimum agent version2.4.0.2 (numeric component
-comparison; the handed-off2.16.0.2 is supported). A complete bounded extension collection must contain only the
-exact ready managed handler and/or historical action handler; missing, failed, transitional, unexpected or
-partial inventory fails closed. Managed handler absence is permitted only for legitimate first use with no
-tracked child/receipt/canary. Missing a previously tracked handler is not permission to recreate it.
+Every **new** command/canary submission has mandatory fresh discovery in `run-command.mjs`, under its operation
+deadline, before intent publication or durable canary invalidation. The same discovery runs again **after** canary
+completion, before protected-input access, and when recording privacy approval. It rechecks the exact bound VM
+resource/unique ID, tenant and principal, running/Succeeded state, Ready agent and the documented minimum agent
+version2.4.0.2 (numeric component comparison; the observed2.16.0.2 is supported).
+
+VM GET's raw `properties.instanceView.vmAgent.extensionHandlers` is an array whose entries have `type`,
+`typeHandlerVersion`, and a **singular** `status` object. Only these exact native pairs are recognized:
+
+| Native type                                   | Runtime version |
+| --------------------------------------------- | --------------- |
+| `Microsoft.CPlat.Core.RunCommandHandlerLinux` | `1.3.28`        |
+| `Microsoft.CPlat.Core.LinuxPatchExtension`    | `1.6.71`        |
+| `Microsoft.CPlat.Core.RunCommandLinux`        | `1.0.12`        |
+
+Each reported native status must be `ProvisioningState/succeeded`, `Info`, `Ready`. Duplicate types, unknown
+types/versions, missing fields/collection or unhealthy/transitional status fail closed. Patch/action native
+handlers are optional, but validated if present. The managed native handler is mandatory once a child, pending
+intent, receipt, candidate or approval is tracked. Its absence is allowed only for genuine first use; the
+recorded successful original canary cannot be relabeled as first use. Exact version pins intentionally stop on
+even a legitimate platform update until reviewed; they are not an automatic upgrade range.
+
+The complete explicit ARM extension list and the exact managed ARM extension GET are checked independently.
+Native Ready + empty ARM list + GET404 is valid:404 means absence **at that ARM path**, not absence of the native
+runtime. Listed-but-404 or unlisted-but-present contradict and reject. An explicit resource must independently
+pass identity/configuration/readiness checks; its runtime must match the pinned native version. Configured
+major/minor versions are validated and must agree between ARM reads, not blindly compared to the full runtime
+patch version. The optional top-level `properties.instanceView.extensions` is also checked for duplicate,
+unknown, unhealthy or contradictory entries and cannot drop explicitly configured extensions; native-only
+handlers need not appear in it. No synthetic ARM resource, nonexistent extension ID or configured version is
+assigned to native metadata.
 
 Readiness failure means zero PUTs, no new pending intent and no durable canary-proof invalidation. It is not a
 nondispatch claim about any earlier uncertain operation. GET-only reconciliation/polling has no submission-readiness
@@ -276,7 +313,7 @@ unexpected plaintext records/leaks are not. Do not print raw surfaces into opera
 The narrow CLI exposes no arbitrary guest shell or log download. Lead-owned, separately reviewed nonsecret
 inspection probes can reuse `managedTransport`, `rootCommand` and fixed result schemas under the same local lock;
 reconcile their receipts before recording proof. Automatic agent/log scanning is not implemented here.
-If the exact handler ID/version cannot be verified, or safe inspection needs a different boundary, stop and
+If the exact native provenance/runtime or any explicit ARM identity cannot be verified, or safe inspection needs a different boundary, stop and
 consult the lead/architect; do not widen the allowlist or invent a fallback.
 
 Create an owner-only0600 JSON proof **only after those real inspections**, with these exact fields:
@@ -306,8 +343,31 @@ Create an owner-only0600 JSON proof **only after those real inspections**, with 
 ```
 
 The placeholder is intentionally not valid proof. Do not infer these booleans from local tests or the
-canary's exit code. `handler` contains exactly the candidate's `id`, `publisher`, `type`, `configuredVersion`
-and running `version`. Record it with:
+canary's exit code. Copy the **whole tagged `handler` descriptor** from the new candidate, not the former ARM-only
+shape. For native-only discovery it has this shape (placeholders are not evidence):
+
+```json
+{
+  "kind": "vmAgent.extensionHandlers",
+  "vmId": "<exact bound VM resource ID>",
+  "vmUniqueId": "<exact bound VM unique ID>",
+  "type": "Microsoft.CPlat.Core.RunCommandHandlerLinux",
+  "runtimeVersion": "1.3.28",
+  "status": {
+    "code": "ProvisioningState/succeeded",
+    "level": "Info",
+    "displayStatus": "Ready"
+  },
+  "armExtension": { "presence": "absent" }
+}
+```
+
+When independently present and validated, `armExtension` instead contains `presence:present`, its actual `id`,
+`publisher`, `type`, `configuredVersion`, `runtimeVersion` and successful `status` (`code`/`level`). Native identity
+is the VM plus reported native type/runtime, not a fabricated extension ID. Volatile timestamps/messages are
+omitted from equality. This is **agent-reported readiness, not binary attestation or privacy proof**. A changed
+descriptor blocks both privacy gates. A post-completion discovery failure leaves the successful bounded receipt
+intact, with no new candidate/approval; it is not permission to retry the completed command. Record real proof with:
 
 ```sh
 node deployment/azure/pilot.mjs management-record-canary <private-proof.json>
@@ -315,6 +375,9 @@ node deployment/azure/pilot.mjs management-record-canary <private-proof.json>
 
 Protected operations fail closed until this record exists and matches the exact VM, handler and current
 transport source hash. A handler/source change requires a new inspected canary; a new canary invalidates old proof.
+Historical public-child preflight and pending GET-only reconciliation still use their recorded hashes, never the
+current source hash. No historical receipt or pending contract is rewritten by this change; old proof shapes or
+transport hashes cannot approve protected input.
 
 Documentation evidence: Context7's Azure catalog returned no managed-Run-Command match. Microsoft Learn
 [Linux managed Run Command](https://learn.microsoft.com/azure/virtual-machines/linux/run-command-managed)

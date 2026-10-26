@@ -8,6 +8,7 @@ import {
 import { state as initial, vmResources } from './fixtures.mjs';
 
 export function handlerResource() {
+  // Explicit ARM cases only; the observed primary fixture has no such resource.
   return {
     id: RUN_COMMAND.handlerId,
     type: 'Microsoft.Compute/virtualMachines/extensions',
@@ -15,14 +16,32 @@ export function handlerResource() {
     properties: {
       publisher: RUN_COMMAND.publisher,
       type: RUN_COMMAND.handlerType,
-      typeHandlerVersion: '1.0',
+      typeHandlerVersion: '1.3',
       provisioningState: 'Succeeded',
       instanceView: {
-        typeHandlerVersion: '1.3.0',
+        typeHandlerVersion: '1.3.28',
         statuses: [{ code: 'ProvisioningState/succeeded', level: 'Info' }],
       },
     },
   };
+}
+
+// Raw nested native shapes from sanitized evidence SHA256 595017029bfccd7da8f8085535e202c0f5a4c80d9b37d9c8ba402926192aa9de.
+export function nativeHandlers() {
+  return [
+    ['Microsoft.CPlat.Core.LinuxPatchExtension', '1.6.71'],
+    ['Microsoft.CPlat.Core.RunCommandHandlerLinux', '1.3.28'],
+    ['Microsoft.CPlat.Core.RunCommandLinux', '1.0.12'],
+  ].map(([type, typeHandlerVersion]) => ({
+    status: {
+      code: 'ProvisioningState/succeeded',
+      displayStatus: 'Ready',
+      level: 'Info',
+      message: 'Plugin enabled',
+    },
+    type,
+    typeHandlerVersion,
+  }));
 }
 
 export function fixtureAuth(claimPatch = {}, tokenPatch = {}) {
@@ -62,27 +81,39 @@ export function managedFixture(options = {}) {
     requests: [],
     calls: [],
     controller: new AbortController(),
-    handler: handlerResource(),
+    handler: undefined, // Exact ARM handler GET returns 404, independently of native readiness.
     vm: vmResources().vm,
-    extensions: { value: [] },
+    extensions: { nextLink: null, value: [] },
     resource: undefined,
     result: undefined,
     imagePresent: false,
     putFailure: undefined,
     mutation: undefined,
   };
+  f.vm.type = 'Microsoft.Compute/virtualMachines';
   f.vm.properties.instanceView = {
+    extensions: [],
     statuses: [
-      { code: 'ProvisioningState/succeeded' },
-      { code: 'PowerState/running' },
+      {
+        code: 'ProvisioningState/succeeded',
+        displayStatus: 'Provisioning succeeded',
+        level: 'Info',
+      },
+      {
+        code: 'PowerState/running',
+        displayStatus: 'VM running',
+        level: 'Info',
+      },
     ],
     vmAgent: {
       vmAgentVersion: '2.16.0.2',
+      extensionHandlers: nativeHandlers(),
       statuses: [
         {
           code: 'ProvisioningState/succeeded',
           level: 'Info',
           displayStatus: 'Ready',
+          message: 'Guest Agent is running',
         },
       ],
     },
@@ -162,8 +193,19 @@ export function managedFixture(options = {}) {
         name: RUN_COMMAND.name,
       };
       f.resource.properties.protectedParameters = [];
-      if (!f.extensions.value.includes(f.handler))
-        f.extensions.value.push(f.handler);
+      // Simulated genuine first use may load the native runtime; it never creates an ARM extension.
+      const natives = f.vm.properties.instanceView.vmAgent.extensionHandlers;
+      if (
+        !natives.some(
+          (item) => item.type === 'Microsoft.CPlat.Core.RunCommandHandlerLinux',
+        )
+      )
+        natives.push(
+          nativeHandlers().find(
+            (item) =>
+              item.type === 'Microsoft.CPlat.Core.RunCommandHandlerLinux',
+          ),
+        );
       f.complete();
       if (f.putFailure === 'after') throw new Error('private provider failure');
       await options.afterPut?.(f, signal);

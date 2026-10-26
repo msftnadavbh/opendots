@@ -549,7 +549,7 @@ async function transportFixture() {
     state: f.state,
     afterPut: async (m) => {
       f.resources.command = m.resource;
-      f.resources.handler = m.handler;
+      if (m.handler) f.resources.handler = m.handler;
     },
   });
   f.state = m.state;

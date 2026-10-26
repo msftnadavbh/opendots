@@ -4,6 +4,18 @@ import { TRANSPORT_SHA256 } from '../run-command.mjs';
 import { VM } from '../scope.mjs';
 import { managedFixture, handlerResource } from './managed-fixture.mjs';
 
+function explicit(f) {
+  f.handler = handlerResource();
+  f.extensions.value = [structuredClone(f.handler)];
+  f.vm.properties.instanceView.extensions = [
+    {
+      name: 'RunCommandHandlerLinux',
+      type: 'Microsoft.CPlat.Core.RunCommandHandlerLinux',
+      ...structuredClone(f.handler.properties.instanceView),
+    },
+  ];
+}
+
 const bad = {
   'missing VM': (f) => {
     f.vm = undefined;
@@ -92,35 +104,42 @@ const bad = {
     f.extensions.nextLink = 'https://management.azure.com/next';
   },
   'duplicate extensions': (f) => {
+    explicit(f);
     f.extensions.value.push(f.handler);
   },
   'foreign extension': (f) => {
     f.extensions.value.push({
       ...handlerResource(),
-      id: f.handler.id + '-foreign',
+      id: handlerResource().id + '-foreign',
     });
   },
   'missing previously tracked handler': (f) => {
-    f.extensions.value = [];
+    f.vm.properties.instanceView.vmAgent.extensionHandlers = [];
   },
   'wrong handler publisher': (f) => {
+    explicit(f);
     f.handler.properties.publisher = 'foreign';
   },
   'unknown handler configured version': (f) => {
+    explicit(f);
     f.handler.properties.typeHandlerVersion = '';
   },
   'unknown handler runtime version': (f) => {
+    explicit(f);
     f.handler.properties.instanceView.typeHandlerVersion = '';
   },
   'missing handler instance view': (f) => {
+    explicit(f);
     delete f.handler.properties.instanceView;
   },
   'conflicting handler instance view': (f) => {
+    explicit(f);
     f.handler.properties.instanceView.statuses.push({
       code: 'ProvisioningState/failed',
     });
   },
   'handler error level': (f) => {
+    explicit(f);
     f.handler.properties.instanceView.statuses[0].level = 'Error';
   },
 };
@@ -133,6 +152,7 @@ for (const state of [
   undefined,
 ])
   bad[`extension state ${state}`] = (f) => {
+    explicit(f);
     f.handler.properties.provisioningState = state;
   };
 
@@ -152,13 +172,14 @@ for (const [name, mutate] of Object.entries(bad))
     assert(!f.state.management.pending);
   });
 
-test('first use requires a successful complete empty inventory, not an absent response or untracked handler', async () => {
+test('first use requires complete explicit inventory and a consistent GET, not an absent response or untracked ARM handler', async () => {
   const f = managedFixture();
   await f.guest.canary();
   assert.equal(f.requests.length, 1);
-  assert.deepEqual(f.calls.slice(0, 4), [
+  assert.deepEqual(f.calls.slice(0, 5), [
     'GET',
     'readiness',
+    'handler',
     'save-intent',
     'PUT',
   ]);
@@ -185,7 +206,14 @@ for (const healthy of [true, false])
       action = handlerResource();
     action.id = `${VM.ids.id}/extensions/RunCommandLinux`;
     action.properties.type = 'RunCommandLinux';
+    action.properties.typeHandlerVersion = '1.0';
+    action.properties.instanceView.typeHandlerVersion = '1.0.12';
     f.extensions.value.push(action);
+    f.vm.properties.instanceView.extensions.push({
+      name: 'RunCommandLinux',
+      type: 'Microsoft.CPlat.Core.RunCommandLinux',
+      ...structuredClone(action.properties.instanceView),
+    });
     const read = f.az.read;
     f.az.read = async (args, options) => {
       if (
@@ -204,7 +232,7 @@ for (const healthy of [true, false])
       await f.guest.canary();
       assert.equal(f.requests.length, 1);
     } else {
-      await assert.rejects(f.guest.canary(), /Historical action/);
+      await assert.rejects(f.guest.canary(), /runtime\/readiness/);
       assert.equal(f.requests.length, 0);
       assert.equal(f.saved.length, 0);
     }

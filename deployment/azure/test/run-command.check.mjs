@@ -353,7 +353,9 @@ test('canary proof must cover every surface and exact VM/handler/transport; real
     assert(!value.includes(secret));
     assert(!value.includes(Buffer.from(secret).toString('base64')));
   }
-  f.handler.properties.instanceView.typeHandlerVersion = '1.4.0';
+  f.vm.properties.instanceView.vmAgent.extensionHandlers.find(
+    (item) => item.type === 'Microsoft.CPlat.Core.RunCommandHandlerLinux',
+  ).typeHandlerVersion = '1.3.29';
   await assert.rejects(
     f.guest.run('true', { input: secret }),
     /handler changed/,
@@ -366,6 +368,7 @@ test('intent precedes PUT; successful receipt is durable before named resource r
   assert.deepEqual(f.calls, [
     'GET',
     'readiness',
+    'handler',
     'save-intent',
     'PUT',
     'GET',

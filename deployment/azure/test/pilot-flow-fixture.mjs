@@ -87,7 +87,7 @@ async function invoke(
     await assert.rejects(m.guest.run('true'));
     f.state = structuredClone(m.state);
     f.resources.command = m.resource;
-    f.resources.handler = m.handler;
+    if (m.handler) f.resources.handler = m.handler;
   }
   let diskState = structuredClone(f.state),
     guarded = 0,
