@@ -136,6 +136,9 @@ no reset, skip-verification flag or automatic retry. Validated source settings a
 The source must already be deallocated/Succeeded. Disk unique IDs, attachments/Detach settings, sizes, security,
 exports, `diskState:Reserved` and the raw REST `properties.LastOwnershipUpdateTime` are required. That timestamp
 changes on attachment or VM start/deallocation transitions; missing/invalid evidence is not assumed safe.
+Only cold-source preservation accepts an omitted/null VM OS managed-disk `storageAccountType` mirror; a present
+mirror must be `Standard_LRS`. The managed-disk reference and exact ID remain mandatory, and dedicated disk GETs
+must still prove `Standard_LRS` and all identity/attachment/timestamp/security/export/retention checks; no SKU is inferred.
 The full source-RG inventory is still read and checked for shape, duplicates and required VM/OS/data records.
 Only those three exact inventory records enter the canonical fingerprint, explicitly identified as
 `inventoryProjection:source-vm-os-data-v1`; their tags remain conservative identity inputs. Unrelated Foundry,

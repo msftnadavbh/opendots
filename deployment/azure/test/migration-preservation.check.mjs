@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { SCUS_PROFILE } from '../profiles.mjs';
 import { SCOPE } from '../scope.mjs';
 import { hashObject } from '../migration-state.mjs';
@@ -30,6 +32,86 @@ async function captured(t) {
   await f.stage('capture');
   return f;
 }
+
+for (const mirror of [undefined, null, 'Standard_LRS'])
+  test(`cold source OS SKU accepts ${String(mirror)} VM mirror only with verified dedicated disks`, async (t) => {
+    const f = await migrationFixture(t);
+    await f.prepare();
+    const before = await f.diskState(),
+      storage = f.source.vm.properties.storageProfile;
+    assert(!Object.hasOwn(storage.osDisk.managedDisk, 'storageAccountType'));
+    assert(
+      !Object.hasOwn(storage.dataDisks[0].managedDisk, 'storageAccountType'),
+    );
+    if (mirror !== undefined)
+      storage.osDisk.managedDisk.storageAccountType = mirror;
+    assert.equal(
+      (await f.controller.preflight('group')).status,
+      'preflight-only',
+    );
+    for (const disk of [f.source.os, f.source.disk]) {
+      assert.equal(disk.sku.name, 'Standard_LRS');
+      assert(
+        f.calls.some(
+          (args) =>
+            args[0] === 'resource' &&
+            args[1] === 'show' &&
+            args[3] === disk.id &&
+            args[5] === '2025-01-02',
+        ),
+      );
+    }
+    assert.deepEqual(await f.diskState(), before);
+    assert.deepEqual(f.creates, []);
+    for (const [name, bytes] of Object.entries(f.files)) {
+      assert.equal(await readFile(join(f.original, name), 'utf8'), bytes);
+      assert.equal(
+        await readFile(join(f.target, 'source', name), 'utf8'),
+        bytes,
+      );
+    }
+  });
+
+for (const fault of [
+  'contradictory VM mirror',
+  'wrong dedicated SKU',
+  'missing dedicated SKU',
+  'failed dedicated GET',
+])
+  test(`cold source OS SKU rejects ${fault} without new intent, provider mutation or archive changes`, async (t) => {
+    const f = await migrationFixture(t);
+    await f.prepare();
+    const before = await f.diskState();
+    if (fault === 'contradictory VM mirror')
+      f.source.vm.properties.storageProfile.osDisk.managedDisk.storageAccountType =
+        'Premium_LRS';
+    if (fault === 'wrong dedicated SKU') f.source.os.sku.name = 'Premium_LRS';
+    if (fault === 'missing dedicated SKU') delete f.source.os.sku;
+    if (fault === 'failed dedicated GET') f.readFault = f.source.os.id;
+    const error =
+      fault === 'contradictory VM mirror'
+        ? /Original source VM identity/
+        : fault === 'failed dedicated GET'
+          ? /Azure CLI/
+          : /Source disk identity/;
+    await assert.rejects(f.controller.validate('group'), error);
+    await assert.rejects(f.controller.apply('group'), error);
+    assert.deepEqual(await f.diskState(), before);
+    assert(!(await f.diskState()).stages.group?.intent);
+    assert.deepEqual(f.creates, []);
+    assert(
+      !f.calls.some((args) =>
+        ['validate', 'what-if', 'create'].includes(args[2]),
+      ),
+    );
+    for (const [name, bytes] of Object.entries(f.files)) {
+      assert.equal(await readFile(join(f.original, name), 'utf8'), bytes);
+      assert.equal(
+        await readFile(join(f.target, 'source', name), 'utf8'),
+        bytes,
+      );
+    }
+  });
 
 test('snapshot readiness requires exact access state and numeric copy completion, with failure precedence', () => {
   for (const stage of ['capture', 'copy'])

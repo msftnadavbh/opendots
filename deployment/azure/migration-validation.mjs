@@ -227,8 +227,9 @@ export async function coldSource(az, profile, inputs, lineage) {
       p.vmId === lineage.vmUniqueId &&
       vm.identity.principalId === lineage.principalId &&
       vm.identity.tenantId === lineage.tenantId &&
-      p.storageProfile.osDisk.managedDisk.storageAccountType ===
-        'Standard_LRS' &&
+      (p.storageProfile.osDisk.managedDisk.storageAccountType == null ||
+        p.storageProfile.osDisk.managedDisk.storageAccountType ===
+          'Standard_LRS') &&
       p.storageProfile.dataDisks[0].toBeDetached !== true &&
       (p.storageProfile.dataDisks[0].managedDisk.storageAccountType == null ||
         p.storageProfile.dataDisks[0].managedDisk.storageAccountType ===

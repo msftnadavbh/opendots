@@ -66,8 +66,7 @@ export async function migrationFixture(t) {
       .split('/')
       .slice(0, 2)
       .join('/');
-  r.vm.properties.storageProfile.osDisk.managedDisk.storageAccountType =
-    'Standard_LRS';
+  delete r.vm.properties.storageProfile.osDisk.managedDisk.storageAccountType;
   for (const kind of ['os', 'disk']) {
     r[kind].type = 'Microsoft.Compute/disks';
     r[kind].sku.name = 'Standard_LRS';
