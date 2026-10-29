@@ -1,8 +1,9 @@
 import { constants } from 'node:fs';
 import { open, mkdir, lstat, realpath, link, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { join, resolve } from 'node:path';
-import { isDeepStrictEqual } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import { SCUS_PROFILE, ORIGINAL_PROFILE, assertProfile } from './profiles.mjs';
 import {
   requirePilot,
@@ -12,7 +13,7 @@ import {
   SCOPE,
 } from './scope.mjs';
 import { validateVmState } from './vm-state.mjs';
-import { validateParameters } from './ssh.mjs';
+import { validateParameters, publicKey } from './ssh.mjs';
 import { writePrivate, syncDirectory } from './runtime-env.mjs';
 
 export const sha256 = (value) =>
@@ -32,6 +33,43 @@ const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const hash = /^[a-f0-9]{64}$/;
 const sourceFiles = SCUS_PROFILE.sourcePreservation.archiveFiles;
 const encode = (value) => JSON.stringify(value, null, 2) + '\n';
+const execute = promisify(execFile);
+
+async function keygen(args) {
+  try {
+    return await execute('ssh-keygen', args, {
+      timeout: 30_000,
+      maxBuffer: 16_384,
+    });
+  } catch {
+    throw new PilotError(
+      'Target SSH key preparation failed; retain the existing key-generation intent and files, never regenerate or expose subprocess output.',
+    );
+  }
+}
+
+async function exclusivePublic(path, content) {
+  if (!(await absent(path))) {
+    requirePilot(
+      (await bytes(path)).equals(content),
+      'Conflicting target public key/parameters; never overwrite or rotate them.',
+    );
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      await file.sync();
+    } finally {
+      await file.close();
+    }
+    return;
+  }
+  const file = await open(path, 'wx', 0o600);
+  try {
+    await file.writeFile(content);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+}
 
 export function archiveInputs(files) {
   requirePilot(
@@ -340,6 +378,7 @@ export async function openMigrationStore(profile, root) {
     const lockIdentity = await lock.stat();
     const allowed = new Set([
       'migration-state.json',
+      profile.artifacts.hostPublicParameters,
       ...Object.keys(profile.stages).flatMap((stage) => [
         `${stage}-template.json`,
         `${stage}-parameters.json`,
@@ -432,11 +471,202 @@ export async function openMigrationStore(profile, root) {
         await archive.close();
       }
     };
+    const loadHostPreparation = async (state) => {
+      const prep = state.stages.host?.preparation;
+      requirePilot(
+        prep?.status === 'complete' &&
+          prep.profileId === profile.id &&
+          prep.migrationId === state.migrationId &&
+          prep.keyType === 'ed25519' &&
+          hash.test(prep.privateKeySha256 ?? '') &&
+          hash.test(prep.publicFileSha256 ?? '') &&
+          hash.test(prep.parametersSha256 ?? ''),
+        'Complete, target-only host key preparation is required; no original key/state transplant.',
+      );
+      const keys = await directory(
+        at(target, profile.artifacts.hostKey.directory),
+        true,
+      );
+      try {
+        const privateBytes = await bytes(
+          at(keys, profile.artifacts.hostKey.privateFile),
+        );
+        const publicBytes = await bytes(
+          at(keys, profile.artifacts.hostKey.publicFile),
+        );
+        const parameters = await bytes(
+          path(profile.artifacts.hostPublicParameters),
+        );
+        requirePilot(
+          sha256(privateBytes) === prep.privateKeySha256 &&
+            sha256(publicBytes) === prep.publicFileSha256 &&
+            publicKey(publicBytes.toString('utf8')) === prep.publicKey &&
+            sha256(parameters) === prep.parametersSha256 &&
+            parameters.equals(
+              Buffer.from(
+                encode({
+                  parameters: { sshPublicKey: { value: prep.publicKey } },
+                }),
+              ),
+            ),
+          'Pinned target private/public key or public parameters changed; no key regeneration or rebinding.',
+        );
+        return prep;
+      } finally {
+        await keys.close();
+      }
+    };
+    const prepareHost = async () => {
+      const state = assertMigrationState(await readState(), profile);
+      const sourceInputs = await loadArchive(state);
+      requirePilot(
+        ['group', 'capture', 'copy'].every(
+          (stage) => state.stages[stage]?.status === 'complete',
+        ) && !state.stages.capture.uncertainPreservation,
+        'Complete verified Stage A before local host preparation.',
+      );
+      const old = state.stages.host ?? {};
+      if (old.preparation?.status === 'complete') {
+        await loadHostPreparation(state);
+        return state;
+      }
+      requirePilot(
+        !old.intent && !old.binding,
+        'Host may already have been submitted; never create, replace or regenerate its key.',
+      );
+      let prep = old.preparation;
+      const fresh = !prep;
+      if (fresh) {
+        requirePilot(
+          (await absent(at(target, profile.artifacts.hostKey.directory))) &&
+            (await absent(path(profile.artifacts.hostPublicParameters))),
+          'Untracked target host key or public parameters exist; no adoption or replacement.',
+        );
+        prep = {
+          status: 'key-generation-intent',
+          profileId: profile.id,
+          migrationId: state.migrationId,
+          keyType: 'ed25519',
+          at: new Date().toISOString(),
+        };
+        state.stages.host = { ...old, preparation: prep };
+        await save(state);
+        await mkdir(at(target, profile.artifacts.hostKey.directory), {
+          mode: 0o700,
+        });
+        await target.sync();
+      }
+      requirePilot(
+        prep.status === 'key-generation-intent' &&
+          prep.profileId === profile.id &&
+          prep.migrationId === state.migrationId &&
+          prep.keyType === 'ed25519',
+        'Unknown target key preparation state; no automatic repair or regeneration.',
+      );
+      const keys = await directory(
+        at(target, profile.artifacts.hostKey.directory),
+        true,
+      );
+      try {
+        const privatePath = at(keys, profile.artifacts.hostKey.privateFile);
+        const publicPath = at(keys, profile.artifacts.hostKey.publicFile);
+        const childPrivatePath = privatePath.replace(
+          '/proc/self/',
+          `/proc/${process.pid}/`,
+        );
+        if (fresh)
+          await keygen([
+            '-q',
+            '-t',
+            'ed25519',
+            '-N',
+            '',
+            '-C',
+            profile.id,
+            '-f',
+            childPrivatePath,
+          ]);
+        const privateBytes = await bytes(privatePath);
+        const derived = publicKey(
+          (await keygen(['-y', '-P', '', '-f', childPrivatePath])).stdout,
+        );
+        requirePilot(
+          derived !== sourceInputs.parameters.sshPublicKey,
+          'Target host key must not reuse the archived original public/private binding.',
+        );
+        requirePilot(
+          (await bytes(privatePath)).equals(privateBytes),
+          'Target private key changed during public-key derivation.',
+        );
+        if (await absent(publicPath))
+          await exclusivePublic(publicPath, Buffer.from(derived + '\n'));
+        const publicFile = await open(
+          publicPath,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+        try {
+          const stat = await publicFile.stat();
+          requirePilot(
+            stat.isFile() &&
+              stat.uid === process.getuid() &&
+              stat.nlink === 1 &&
+              stat.size <= 16_384 &&
+              [0o600, 0o644].includes(stat.mode & 0o777),
+            'Unsafe target SSH public-key file.',
+          );
+          const content = await publicFile.readFile();
+          requirePilot(
+            publicKey(content.toString('utf8')) === derived,
+            'Target public and private key do not match; no replacement.',
+          );
+          await publicFile.chmod(0o600);
+          await publicFile.sync();
+        } finally {
+          await publicFile.close();
+        }
+        const privateFile = await open(
+          privatePath,
+          constants.O_RDONLY | constants.O_NOFOLLOW,
+        );
+        try {
+          await privateFile.sync();
+        } finally {
+          await privateFile.close();
+        }
+        await keys.sync();
+        const parameters = Buffer.from(
+          encode({ parameters: { sshPublicKey: { value: derived } } }),
+        );
+        await exclusivePublic(
+          path(profile.artifacts.hostPublicParameters),
+          parameters,
+        );
+        await target.sync();
+        state.stages.host = {
+          ...old,
+          preparation: {
+            ...prep,
+            status: 'complete',
+            publicKey: derived,
+            privateKeySha256: sha256(privateBytes),
+            publicFileSha256: sha256(await bytes(publicPath)),
+            parametersSha256: sha256(parameters),
+          },
+        };
+        await save(state);
+        await loadHostPreparation(state);
+        return state;
+      } finally {
+        await keys.close();
+      }
+    };
     return {
       path,
       readState,
       save,
       loadArchive,
+      prepareHost,
+      loadHostPreparation,
       deploymentPath: (name) =>
         path(name).replace('/proc/self/', `/proc/${process.pid}/`),
       read: async (name) => JSON.parse(await bytes(path(name))),

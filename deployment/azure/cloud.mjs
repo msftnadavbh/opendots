@@ -21,6 +21,12 @@ import {
   assertManagedHandler,
 } from './run-command.mjs';
 import { ORIGINAL_PROFILE, SCUS_PROFILE, assertProfile } from './profiles.mjs';
+import {
+  hostDescriptors,
+  hostImageUrl,
+  modelRoleListUrl,
+  HOST_OBSERVATION_QUERY,
+} from './migration-host.mjs';
 
 const execute = promisify(execFile);
 // Azure CLI rejects get-access-token when tenant and subscription are both supplied.
@@ -82,7 +88,7 @@ export function createAz(run = execute, profile = ORIGINAL_PROFILE) {
         ...(value.scope === 'group'
           ? [
               '--resource-group',
-              profile.compute.resourceGroup,
+              value.resourceGroup ?? profile.compute.resourceGroup,
               '--mode',
               'Incremental',
             ]
@@ -123,6 +129,13 @@ export function createAz(run = execute, profile = ORIGINAL_PROFILE) {
     const reads = [
       ['account', 'show'],
       principalArgs,
+      ...[hostImageUrl(profile), modelRoleListUrl(profile)].map((url) => [
+        'rest',
+        '--method',
+        'get',
+        '--url',
+        url,
+      ]),
       ...['exists', 'show'].map((action) => [
         'group',
         action,
@@ -148,6 +161,14 @@ export function createAz(run = execute, profile = ORIGINAL_PROFILE) {
         '--query',
         'instanceView.statuses',
       ],
+      [
+        'vm',
+        'get-instance-view',
+        '--ids',
+        profile.compute.vm.id,
+        '--query',
+        HOST_OBSERVATION_QUERY,
+      ],
       ...[
         profile.sourcePreservation.vmId,
         profile.sourcePreservation.osDiskId,
@@ -163,13 +184,44 @@ export function createAz(run = execute, profile = ORIGINAL_PROFILE) {
         '--api-version',
         id === profile.sourcePreservation.vmId ? '2025-11-01' : '2025-01-02',
       ]),
+      ...[...hostDescriptors(profile), profile.compute.disks.os].map((r) => [
+        'resource',
+        'show',
+        '--ids',
+        r.id,
+        '--api-version',
+        r.type.startsWith('Microsoft.Network/')
+          ? '2025-05-01'
+          : r.type === 'Microsoft.Compute/virtualMachines'
+            ? '2025-11-01'
+            : '2025-01-02',
+      ]),
+      [
+        'resource',
+        'show',
+        '--ids',
+        profile.sharedServices.foundry.id,
+        '--api-version',
+        '2025-06-01',
+      ],
+      [
+        'resource',
+        'show',
+        '--ids',
+        profile.modelRole.id,
+        '--api-version',
+        '2022-04-01',
+      ],
       ...Object.values(profile.stages).flatMap((value) => [
         [
           'deployment',
           value.scope,
           'list',
           ...(value.scope === 'group'
-            ? ['--resource-group', profile.compute.resourceGroup]
+            ? [
+                '--resource-group',
+                value.resourceGroup ?? profile.compute.resourceGroup,
+              ]
             : []),
           '--query',
           `[?name=='${value.deploymentName}'].id`,
@@ -181,7 +233,10 @@ export function createAz(run = execute, profile = ORIGINAL_PROFILE) {
           '--name',
           value.deploymentName,
           ...(value.scope === 'group'
-            ? ['--resource-group', profile.compute.resourceGroup]
+            ? [
+                '--resource-group',
+                value.resourceGroup ?? profile.compute.resourceGroup,
+              ]
             : []),
         ],
       ]),

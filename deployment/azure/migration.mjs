@@ -17,6 +17,8 @@ import {
   requireStage,
   deploymentId,
   stageIds,
+  stageResourceGroup,
+  assertStageOutputs,
   desiredResources,
   stageParameters,
   assertStageTemplate,
@@ -29,6 +31,17 @@ import {
   assertParameters,
   assertWhatIf,
 } from './migration-validation.mjs';
+import {
+  isHostStage,
+  hostImageUrl,
+  modelRoleListUrl,
+  assertHostImage,
+  bindHost,
+  assertSharedFoundry,
+  bindModelRole,
+  hostObservation,
+  HOST_OBSERVATION_QUERY,
+} from './migration-host.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const execute = promisify(execFile);
@@ -62,7 +75,7 @@ function deploymentArgs(profile, stage, action) {
     '--name',
     plan.deploymentName,
     ...(plan.scope === 'group'
-      ? ['--resource-group', profile.compute.resourceGroup]
+      ? ['--resource-group', stageResourceGroup(profile, stage)]
       : []),
   ];
 }
@@ -73,7 +86,7 @@ async function deploymentExists(az, profile, stage) {
     plan.scope,
     'list',
     ...(plan.scope === 'group'
-      ? ['--resource-group', profile.compute.resourceGroup]
+      ? ['--resource-group', stageResourceGroup(profile, stage)]
       : []),
     '--query',
     `[?name=='${plan.deploymentName}'].id`,
@@ -117,9 +130,13 @@ async function targetInventory(az, profile, state) {
     state,
   );
   const items = await inventory(az, profile.compute.resourceGroup);
-  const allowed = ['capture', 'copy'].flatMap((stage) =>
+  const allowed = ['capture', 'copy', 'host'].flatMap((stage) =>
     state.stages[stage]?.intent
-      ? [...stageIds(profile, stage), deploymentId(profile, stage)]
+      ? [
+          ...stageIds(profile, stage),
+          deploymentId(profile, stage),
+          ...(stage === 'host' ? [profile.compute.disks.os.id] : []),
+        ]
       : [],
   );
   for (const item of items)
@@ -158,6 +175,18 @@ export function migrationController({
           !state.stages.capture.uncertainPreservation,
         'Complete verified cold capture first; uncertain preservation cannot authorize copying.',
       );
+    if (isHostStage(stage))
+      requirePilot(
+        ['group', 'capture', 'copy'].every(
+          (name) => state.stages[name]?.status === 'complete',
+        ) && !state.stages.capture.uncertainPreservation,
+        'B1 requires completed, certain Stage A preservation.',
+      );
+    if (stage === 'model-role')
+      requirePilot(
+        state.stages.host?.status === 'complete' && state.stages.host.binding,
+        'Complete and bind the actual target host before model-role validation.',
+      );
   };
   const assertIntent = (saved, state, stage) => {
     requirePilot(
@@ -184,6 +213,21 @@ export function migrationController({
       saved.intent.request.parameters,
       stageParameters(profile, state, stage),
     );
+    if (isHostStage(stage))
+      requirePilot(
+        isDeepStrictEqual(
+          saved.intent.request.copiedSnapshots,
+          state.stages.copy?.resources,
+        ) &&
+          (stage === 'host'
+            ? saved.intent.request.hostPreparationSha256 ===
+              hashObject(state.stages.host.preparation)
+            : isDeepStrictEqual(
+                saved.intent.request.hostBinding,
+                state.stages.host.binding,
+              )),
+        'Recorded B1 source/key/host dependencies changed; historical intent cannot be rebound.',
+      );
   };
   const verifyDeployment = async (saved, state, stage) => {
     assertIntent(saved, state, stage);
@@ -235,6 +279,148 @@ export function migrationController({
       );
     }
   };
+  const verifyCopied = async (state) => {
+    await verifyCaptured(state);
+    const deployment = await verifyDeployment(state.stages.copy, state, 'copy');
+    requirePilot(
+      state.stages.copy.status === 'complete' &&
+        deployment.properties.provisioningState === 'Succeeded' &&
+        !deployment.properties.error,
+      'Both recorded SCUS copies must be complete and independently verifiable.',
+    );
+    assertStageOutputs(deployment.properties.outputResources, profile, 'copy');
+    const spec = desiredResources(profile, state, 'copy');
+    for (const [index, kind] of ['os', 'data'].entries()) {
+      const value = await resources(az, spec[index].id, '2025-01-02');
+      snapshotRecord(
+        value,
+        spec[index],
+        state.stages.copy.resources[kind],
+        state.stages.copy.intent.at,
+        state,
+      );
+      requirePilot(
+        snapshotReady(value, 'copy'),
+        'SCUS source snapshot is not available at numeric copy completion 100.',
+      );
+    }
+  };
+  const readHost = async () => {
+    const n = profile.compute.network,
+      d = profile.compute.disks;
+    const result = {};
+    for (const [key, r] of Object.entries({
+      nsg: n.nsg,
+      vnet: n.vnet,
+      pip: n.pip,
+      nic: n.nic,
+      data: d.data,
+      audit: d.audit,
+      vm: profile.compute.vm,
+      os: d.os,
+    }))
+      result[key] = await resources(
+        az,
+        r.id,
+        r.type.startsWith('Microsoft.Network/')
+          ? '2025-05-01'
+          : key === 'vm'
+            ? '2025-11-01'
+            : '2025-01-02',
+      );
+    return result;
+  };
+  const verifyHostInventory = async (state) => {
+    const items = await targetInventory(az, profile, state);
+    const required = [
+      ...stageIds(profile, 'capture'),
+      ...stageIds(profile, 'copy'),
+      ...stageIds(profile, 'host'),
+      profile.compute.disks.os.id,
+    ];
+    requirePilot(
+      required.every((id) => items.some((item) => sameId(item.id, id))),
+      'Target runtime inventory is incomplete; every retained snapshot, declared host resource and exact implicit OS disk is required.',
+    );
+  };
+  const verifyHost = async (state) => {
+    const saved = state.stages.host;
+    requirePilot(
+      saved?.status === 'complete' && saved.binding,
+      'A completed actual target host binding is required.',
+    );
+    const deployment = await verifyDeployment(saved, state, 'host');
+    requirePilot(
+      deployment.properties.provisioningState === 'Succeeded' &&
+        !deployment.properties.error,
+      'Target host deployment is no longer complete.',
+    );
+    assertStageOutputs(deployment.properties.outputResources, profile, 'host');
+    await verifyHostInventory(state);
+    const values = await readHost();
+    const binding = bindHost(
+      values,
+      profile,
+      state,
+      saved.intent.request.expected,
+      saved.intent.at,
+      saved.binding,
+    );
+    requirePilot(
+      binding,
+      'Target host resources are not currently complete; no dependent authorization.',
+    );
+    return { binding, values };
+  };
+  // Only the authenticated Foundry atScope response establishes ancestry; these IDs never authorize writes.
+  const roleInventoryId = (id) => {
+    if (typeof id !== 'string' || /[%\\?#\s\x00-\x1f\x7f]/.test(id))
+      return false;
+    const match =
+      /^(.*)\/providers\/Microsoft\.Authorization\/roleAssignments\/([^/]+)$/i.exec(
+        id,
+      );
+    if (!match || !uuid.test(match[2])) return false;
+    const ancestor = match[1];
+    if (
+      [
+        '',
+        `/subscriptions/${profile.account.subscriptionId}`,
+        profile.stages['model-role'].groupId,
+        profile.modelRole.scope,
+      ].some((scope) => sameId(ancestor, scope))
+    )
+      return true;
+    const group =
+      /^\/providers\/Microsoft\.Management\/managementGroups\/([^/]+)$/i.exec(
+        ancestor,
+      );
+    return group !== null && !['.', '..'].includes(group[1]);
+  };
+  const roleInventory = async () => {
+    const response = await az.read([
+      'rest',
+      '--method',
+      'get',
+      '--url',
+      modelRoleListUrl(profile),
+    ]);
+    requirePilot(
+      response &&
+        !response.error &&
+        !response.nextLink &&
+        Array.isArray(response.value) &&
+        response.value.every(
+          (r) =>
+            roleInventoryId(r?.id) &&
+            r.type?.toLowerCase() === 'microsoft.authorization/roleassignments',
+        ) &&
+        new Set(response.value.map((r) => r.id.toLowerCase())).size ===
+          response.value.length,
+      'Complete, nonduplicated shared-account role inventory is required; no pagination or absence inference on errors.',
+    );
+    return response.value.map((r) => r.id);
+  };
   const preflight = async (stage) => {
     requireStage(profile, stage);
     const { state, inputs } = await load();
@@ -243,6 +429,7 @@ export function migrationController({
       'Stage already has a durable intent; use GET-only reconcile, never apply again.',
     );
     dependency(state, stage);
+    if (stage === 'host') await store.loadHostPreparation(state);
     await az.verify();
     if (stage !== 'group') {
       const deployment = await verifyDeployment(
@@ -256,7 +443,8 @@ export function migrationController({
         'Recorded group deployment is no longer verifiable.',
       );
     }
-    const items = await targetInventory(az, profile, state);
+    let items = await targetInventory(az, profile, state);
+    let b1 = {};
     if (stage === 'group')
       requirePilot(
         !(await groupExists(az, profile)),
@@ -267,6 +455,49 @@ export function migrationController({
       'Fixed deployment name already exists without this stage intent; no adoption or name regeneration.',
     );
     if (stage === 'copy') await verifyCaptured(state);
+    if (isHostStage(stage)) {
+      await verifyCopied(state);
+      b1 = { copiedSnapshots: structuredClone(state.stages.copy.resources) };
+      if (stage === 'host') {
+        b1.hostPreparationSha256 = hashObject(state.stages.host.preparation);
+        b1.image = assertHostImage(
+          await az.read([
+            'rest',
+            '--method',
+            'get',
+            '--url',
+            hostImageUrl(profile),
+          ]),
+          profile,
+        );
+      } else {
+        b1.hostBinding = (await verifyHost(state)).binding;
+        assertSharedFoundry(
+          await resources(az, profile.sharedServices.foundry.id, '2025-06-01'),
+          profile,
+        );
+        const roles = await roleInventory();
+        requirePilot(
+          !roles.some((id) => sameId(id, profile.modelRole.id)),
+          'Fixed model role exists without this stage intent; no adoption or renaming.',
+        );
+        items = await inventory(az, stageResourceGroup(profile, stage));
+        requirePilot(
+          items.some((item) =>
+            sameId(item.id, profile.sharedServices.foundry.id),
+          ) && !items.some((item) => sameId(item.id, profile.modelRole.id)),
+          'Shared inventory must contain the existing Foundry account and no untracked target role.',
+        );
+        items = [
+          ...new Set([
+            ...items.map((r) => r.id.toLowerCase()),
+            ...roles.map((id) => id.toLowerCase()),
+          ]),
+        ]
+          .sort()
+          .map((id) => ({ id }));
+      }
+    }
     const source = await coldSource(az, profile, inputs, state.source.lineage);
     const compiled = await compile(profile, stage);
     const template = JSON.parse(compiled);
@@ -284,6 +515,7 @@ export function migrationController({
       source,
       existingIds: items.map((r) => r.id),
       expected: desiredResources(profile, state, stage),
+      ...b1,
     };
     return {
       state,
@@ -376,6 +608,12 @@ export function migrationController({
       status: 'review-required',
       proposalSha256: hashObject(proof),
       changesSha256: proof.changesSha256,
+      ...(stage === 'host'
+        ? {
+            sizeEvidence:
+              'Provider validation accepted pinned-image 32GiB request; image minimum not independently measured',
+          }
+        : {}),
     };
   };
   const reconcile = async (stage) => {
@@ -437,15 +675,7 @@ export function migrationController({
     );
     if (p.provisioningState !== 'Succeeded')
       return { stage, status: 'pending', reason: 'deployment not complete' };
-    requirePilot(
-      isDeepStrictEqual(
-        (p.outputResources ?? []).map((r) => r.id.toLowerCase()).sort(),
-        stageIds(profile, stage)
-          .map((id) => id.toLowerCase())
-          .sort(),
-      ),
-      'Deployment output-resource graph differs from the approved stage.',
-    );
+    assertStageOutputs(p.outputResources, profile, stage);
     if (stage === 'group') {
       requirePilot(
         await groupExists(az, profile),
@@ -462,6 +692,40 @@ export function migrationController({
         state,
       );
       next.resources = { groupId: profile.compute.groupId };
+    } else if (stage === 'host') {
+      await verifyHostInventory(state);
+      await verifyCopied(state);
+      const binding = bindHost(
+        await readHost(),
+        profile,
+        state,
+        saved.intent.request.expected,
+        saved.intent.at,
+        saved.binding,
+      );
+      await verifyCopied(state);
+      if (!binding)
+        return {
+          stage,
+          status: 'pending',
+          reason:
+            'host resources are not all provisioning Succeeded; no final disk binding',
+        };
+      next.binding = binding;
+    } else if (stage === 'model-role') {
+      await verifyCopied(state);
+      const { binding } = await verifyHost(state);
+      assertSharedFoundry(
+        await resources(az, profile.sharedServices.foundry.id, '2025-06-01'),
+        profile,
+      );
+      next.binding = bindModelRole(
+        await resources(az, profile.modelRole.id, '2022-04-01'),
+        profile,
+        binding.vm.principalId,
+        saved.binding,
+      );
+      await verifyHost(state);
     } else {
       if (stage === 'copy') await verifyCaptured(state);
       const items = await targetInventory(az, profile, state);
@@ -506,6 +770,18 @@ export function migrationController({
       status: 'complete',
       historical: saved.status === 'complete',
       applicationActivated: false,
+      ...(isHostStage(stage)
+        ? {
+            hostBound: true,
+            modelRoleAssigned: stage === 'model-role',
+            guestStagesAvailable: false,
+            osExportHardening: 'pending-before-protected-input',
+            dataAudit: 'pending',
+            ...(stage === 'host'
+              ? { sizeEvidence: 'created OS reports 32GiB' }
+              : { inferenceVerified: false }),
+          }
+        : {}),
     };
   };
   const apply = async (stage) => {
@@ -580,6 +856,7 @@ export function migrationController({
       '--no-wait',
     ];
     await az.createWithIntent(args, async () => {
+      if (stage === 'host') await store.loadHostPreparation(plan.state);
       requirePilot(
         sha256(await store.readBytes(`${stage}-template.json`)) ===
           plan.request.templateSha256 &&
@@ -595,6 +872,36 @@ export function migrationController({
     });
     return reconcile(stage);
   };
+  const status = async () => {
+    const { state } = await load();
+    await az.verify();
+    const { binding } = await verifyHost(state);
+    const view = await az.read(
+      [
+        'vm',
+        'get-instance-view',
+        '--ids',
+        profile.compute.vm.id,
+        '--query',
+        HOST_OBSERVATION_QUERY,
+      ],
+      { timeoutMs: 30_000 },
+    );
+    const current = await resources(az, profile.compute.vm.id, '2025-11-01');
+    requirePilot(
+      current.properties?.vmId === binding.vm.uniqueId &&
+        current.identity?.principalId === binding.vm.principalId &&
+        current.identity.tenantId === binding.vm.tenantId,
+      'Target VM identity changed during control-plane observation.',
+    );
+    return {
+      profileId: profile.id,
+      kind: 'control-plane-observation-only',
+      hostBound: true,
+      modelRoleRecorded: state.stages['model-role']?.status === 'complete',
+      ...hostObservation(view, current.properties.provisioningState),
+    };
+  };
   return {
     preflight: async (stage) => {
       const plan = await preflight(stage);
@@ -608,6 +915,7 @@ export function migrationController({
     validate,
     apply,
     reconcile,
+    status,
   };
 }
 
@@ -623,11 +931,13 @@ export async function migrationMain(
   );
   const [command, stage, ...extra] = args;
   requirePilot(
-    (command === 'prepare' && !stage && !extra.length) ||
+    (['prepare', 'prepare-host', 'status'].includes(command) &&
+      !stage &&
+      !extra.length) ||
       (['preflight', 'validate', 'apply', 'reconcile'].includes(command) &&
         !extra.length &&
         Object.hasOwn(profile.stages, stage ?? '')),
-    'Target supports prepare or preflight/validate/apply/reconcile group|capture|copy only. Host/audit/configure/activate, guest commands and arbitrary templates/scopes are unavailable.',
+    'Target supports prepare/prepare-host/status or preflight/validate/apply/reconcile group|capture|copy|host|model-role only. Audit/configure/activate, guest commands and arbitrary templates/scopes are unavailable.',
   );
   assertProfileEnvironment(profile);
   process.umask(0o077);
@@ -640,6 +950,17 @@ export async function migrationMain(
           profileId: profile.id,
           status: 'local-source-archive-prepared',
           sourceArchiveSha256: state.source.archiveSha256,
+          cloudChanged: false,
+        }),
+      );
+    } else if (command === 'prepare-host') {
+      const state = await store.prepareHost();
+      console.log(
+        JSON.stringify({
+          profileId: profile.id,
+          status: 'local-host-key-prepared',
+          publicParametersSha256:
+            state.stages.host.preparation.parametersSha256,
           cloudChanged: false,
         }),
       );

@@ -84,13 +84,12 @@ test('unknown/conflicting profiles and future target commands fail before filesy
       'audit',
       'configure',
       'activate',
-      'status',
       'management-canary',
       'deploy',
       'stop',
       'resume',
     ].map((command) => ['--profile', 'pilot-scus-v1', command]),
-    ['--profile', 'pilot-scus-v1', 'apply', 'host'],
+    ['--profile', 'pilot-scus-v1', 'apply', 'audit'],
   ])
     await assert.rejects(main(args), /profile|unavailable|Only/);
   await assert.rejects(

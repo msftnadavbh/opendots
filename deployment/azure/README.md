@@ -12,15 +12,17 @@ guest eligibility is still unknown. This transport fix authorizes no power start
 Do not change tags/schedules or run a restart loop.
 This document and local fixture results are not live authorization or acceptance evidence.
 
-The separately approved South Central US preservation increment is available through the explicit
-`--profile pilot-scus-v1` selector. See [South Central US preservation](migration.md) for the finite
-group/capture/copy procedure, private review contract, source/copy lineage and GET-only reconciliation.
-It does not deploy a target VM or implement host/audit/configuration/activation. The original profile
-remains the default, with its original state, resources and guards; no source records are migrated in place.
+The separately approved South Central US lane is available through the explicit `--profile pilot-scus-v1`
+selector. See [South Central US migration](migration.md) for completed Stage A preservation and the new B1
+`prepare-host` → `host` → `model-role` flow, private review contract and GET-only reconciliation. Do not replay
+completed Stage A applies. B1 creates/binds infrastructure and observes target control-plane metadata only;
+guest qualification, OS/data audit, configuration and activation remain unavailable. This is not usable OpenDots
+or live B1 validation. The original profile remains the default with its original state, resources and guards.
 Preservation readiness requires explicit snapshot access availability as well as provisioning/copy completion.
 The preservation lane authenticates before its durable create-intent callback, recovers only exact planned local
 archive publication states, and fingerprints only the original VM/OS/data inventory records while still checking
-the full source inventory. See the migration runbook for CopyStart UID compatibility and retained uncertainty;
+the full source inventory. See the migration runbook for distinct snapshot CopyStart/restored-disk Copy UID
+contracts and retained uncertainty;
 independent review and lead verification remain required before any live caller.
 
 The recorded drift includes both original disks at `Standard_LRS`, absent data-disk tags, and
@@ -79,7 +81,8 @@ do not run browser sidecars, untrusted computers or unrelated workloads on this 
 ## Preserve state and validate locally
 
 Use Node 24 for app checks; the operator supports Node 22.23+. Azure CLI, local Bicep,
-and Docker are needed for the corresponding validation/build work. SSH is not used by the active operator.
+and Docker are needed for the corresponding validation/build work. SSH connections are not used by the active
+operator. B1 local admin-key preparation requires `ssh-keygen`; this does not open TCP22 or authorize SSH access.
 Keep the operator clock synchronized (NTP).
 The disk-time sanity check allows ten minutes of skew; it never substitutes for prior absence,
 ownership and immutable identity checks.
@@ -97,7 +100,7 @@ set -eu
 mkdir -p -m 700 /tmp/opencode
 "$HOME/.azure/bin/bicep" build infra/main.bicep --outfile /tmp/opencode/opendots-pilot-arm.json
 mkdir -p -m 700 /tmp/opencode/opendots-scus-contracts
-for stage in group capture copy; do
+for stage in group capture copy host model-role; do
   "$HOME/.azure/bin/bicep" build "infra/scus/$stage.bicep" --outfile "/tmp/opencode/opendots-scus-contracts/$stage.json"
 done
 PILOT_ARM_TEMPLATE=/tmp/opencode/opendots-pilot-arm.json \
@@ -111,7 +114,7 @@ the full pilot graph, including account-scoped roles, Entra-only auth, the retai
 NVMe/disk retention, exactly two NSG rules with no SSH allowance, historical public parameters,
 no unexpected resources, and no production imports. Managed Run Command is deliberately **not** an ARM
 deployment resource: protected inputs must never enter deployment history.
-The preservation tests also require `PILOT_SCUS_TEMPLATE_DIR`; the three new compiled graphs are mandatory,
+The migration tests also require `PILOT_SCUS_TEMPLATE_DIR`; all five fixed SCUS compiled graphs are mandatory,
 not skipped when testing the original operator regressions. Compiling them performs no Azure operation.
 Disk tests mock all device commands; they never format a host device.
 

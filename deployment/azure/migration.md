@@ -1,14 +1,21 @@
-# South Central US — preservation increment only
+# South Central US — preservation and B1 host infrastructure
 
 This is **not migration completion, application readiness or Azure validation**. The approved target is
 `pilot-scus-v1`, `rg-opendots-pilot-scus`, `southcentralus`, in the original fixed account. The original
 profile (`original`) remains the default. Exactly these two immutable profiles exist. Neither environment
 variables, a configuration file nor arbitrary region/group/template arguments select a profile.
 
-This increment can create only the target group and four incremental snapshots. It has no source
-start/stop/delete/export-policy/credential operation, no target VM/disk attachment, and no formatting or
-guest command. Host, restore-only disk handling, OS/data audit, offline configuration, privacy qualification,
-activation and cutover acceptance are later increments and reject before effects here.
+Stage A (group/capture/copy) is lead-reported **live complete**. Preserve its journal, archives, requests,
+templates, parameters and hashes; do not rerun its applies. B1 adds a fresh target host, an attached restored
+application disk, a separately created **unattached** OS-audit disk, and a separate model-role stage. This source
+revision is not proof that B1 has been validated or deployed. Each new live caller still needs lead verification
+and independent review.
+
+There is no source start/stop/delete/export-policy operation, credential delivery, formatting or guest command.
+B1 creates no extension, managed Run Command, customData, userData or bootstrap script. The fresh stock image
+boots as part of VM creation; this is not an application launch or proof of safe audit-disk boot containment.
+Target management/privacy qualification, restore-only guest handling, OS/data audit, offline configuration,
+activation and cutover acceptance remain B2 work and reject before effects here.
 
 ## Boundaries
 
@@ -18,6 +25,8 @@ activation and cutover acceptance are later increments and reject before effects
   copy snapshots reside in that RG in South Central US. Per-resource locations are checked independently.
 - Original East US 2 Foundry, ACR, telemetry, Sandbox and Intelligence remain unchanged. The profile reserves
   `artifacts/azure-pilot-shared` for later coordination, but this increment creates no token machinery there.
+  The sole additional shared-scope write is the separately reviewed OpenAI User assignment to the actual new VM
+  identity on the existing Foundry account, plus its fixed deployment bookkeeping. No original role is replaced.
 - Source VM and disk resource/unique IDs come from the read-only original operator archive and fresh ARM reads,
   not chat-provided dynamic identities. The source filesystem binding is
   `a18c384f-d8ca-40a5-8a93-18ba8e1890e3`; this is archival lineage, not a guest filesystem audit or format permit.
@@ -67,15 +76,18 @@ archival data only; none becomes active target state. No target guest bundle is 
 Linux `/proc/<operator-pid>/fd/<directory-fd>/...` paths keep the fixed private request files reachable by the CLI
 child while the operator holds its directory descriptors. There is no arbitrary request-file CLI argument.
 
-## Three finite stages
+## Finite stages
 
-| Stage     | Fixed deployment                              | Resource writes                                                              |
-| --------- | --------------------------------------------- | ---------------------------------------------------------------------------- |
-| `group`   | `opendots-scus-group-v1` (subscription scope) | Only `rg-opendots-pilot-scus`                                                |
-| `capture` | `opendots-scus-capture-v1` (new RG)           | `snap-opendots-source-os-v1`, `snap-opendots-source-data-v1` in East US 2    |
-| `copy`    | `opendots-scus-copy-v1` (new RG)              | `snap-opendots-scus-os-v1`, `snap-opendots-scus-data-v1` in South Central US |
+| Stage        | Fixed deployment                                  | Resource writes                                                                       |
+| ------------ | ------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `group`      | `opendots-scus-group-v1` (subscription scope)     | Only `rg-opendots-pilot-scus`                                                         |
+| `capture`    | `opendots-scus-capture-v1` (new RG)               | `snap-opendots-source-os-v1`, `snap-opendots-source-data-v1` in East US 2             |
+| `copy`       | `opendots-scus-copy-v1` (new RG)                  | `snap-opendots-scus-os-v1`, `snap-opendots-scus-data-v1` in South Central US          |
+| `host`       | `opendots-scus-host-v1` (new RG)                  | Seven declared target resources plus the exact implicit fresh OS disk described below |
+| `model-role` | `opendots-scus-model-role-v1` (**shared old RG**) | One account-scoped OpenAI User assignment for the pinned target MI                    |
 
-Run each stage completely before the next. Do not chain unreviewed applies:
+Run each stage completely before the next. Do not chain unreviewed applies. The following Stage A commands are
+procedure reference only: **do not replay them against the already-completed migration**.
 
 ```sh
 node deployment/azure/pilot.mjs --profile pilot-scus-v1 preflight group
@@ -136,7 +148,7 @@ no reset, skip-verification flag or automatic retry. Validated source settings a
 The source must already be deallocated/Succeeded. Disk unique IDs, attachments/Detach settings, sizes, security,
 exports, `diskState:Reserved` and the raw REST `properties.LastOwnershipUpdateTime` are required. That timestamp
 changes on attachment or VM start/deallocation transitions; missing/invalid evidence is not assumed safe.
-Only cold-source preservation accepts an omitted/null VM OS managed-disk `storageAccountType` mirror; a present
+Cold-source preservation accepts an omitted/null VM OS managed-disk `storageAccountType` mirror; a present
 mirror must be `Standard_LRS`. The managed-disk reference and exact ID remain mandatory, and dedicated disk GETs
 must still prove `Standard_LRS` and all identity/attachment/timestamp/security/export/retention checks; no SKU is inferred.
 The full source-RG inventory is still read and checked for shape, duplicates and required VM/OS/data records.
@@ -179,8 +191,131 @@ access remains pending; neither SKU nor provisioning alone implies availability.
 numeric `completionPercent === 100`; missing/string/incomplete progress stays pending. Failed/canceled snapshots
 or a copy error remain failures even when another snapshot is merely pending. Access/progress are volatile,
 not immutable snapshot identity, so legitimate transitions reconcile without replacement or a new create.
-Fresh dependent-stage authorization rechecks access, and later disk restore must do so too (not implemented here).
-This is a snapshot-copy gate, **not** a Standard HDD disk hydration rule for later host work.
+Fresh dependent-stage authorization rechecks access, including B1 restoration. This is a snapshot-copy gate,
+**not** a Standard HDD disk hydration rule.
+
+## B1: local key preparation → host → model-role
+
+After source review and with Stage A complete, the lead uses the same explicit profile and reviewed stage flow:
+
+```sh
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 prepare-host
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 preflight host
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 validate host
+# Independently review the exact host proposal; write host-review.json using the contract above.
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 apply host
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 reconcile host
+# While pending, repeat only reconcile; never apply again.
+
+# Only after successful host readback has pinned the ACTUAL new MI:
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 preflight model-role
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 validate model-role
+# Independently review that actual-principal proposal and write model-role-review.json.
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 apply model-role
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 reconcile model-role
+node deployment/azure/pilot.mjs --profile pilot-scus-v1 status
+```
+
+### Target-only admin key
+
+Linux VM creation needs a public admin key, but it does **not** authorize opening SSH. `prepare-host` is local
+only: it reads the preserved Stage A archive/state, never source private keys or `.env`, and uses local
+`ssh-keygen` to create one fresh Ed25519 pair in the fixed owned0700
+`artifacts/azure-pilot-scus/host-key/` directory. The private `id_ed25519` and public `id_ed25519.pub` are kept0600;
+only the public key enters `host-public-parameters.json` and ARM. No operator CIDR is a target parameter.
+
+The version-3 host stage records a key-generation intent before creation. An untracked directory/parameter file
+is not adopted. A completed key pair can finalize interrupted preparation using that same private key (a missing
+public companion can be derived); an absent, partial, unsafe or conflicting private key never triggers another
+generation. Conflicting/partial public parameters stop without overwrite. Complete preparation fsyncs material
+and directories, verifies private/public correspondence, and pins exact file hashes. Later preparation and host
+preflights verify those bindings; possible VM submission can never rotate or regenerate a key. No private key or
+subprocess output is logged or transmitted. Missing-key/interrupted-lock recovery is lead-owned investigation,
+not a force/reset option. Original key material remains untouched.
+
+### Fixed host graph and readback
+
+| Resource                  | Fixed name / contract                                                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| VM                        | `vm-opendots-pilot-scus`, Standard_D2als_v7, system-assigned MI, Linux/Gen2/NVMe/TrustedLaunch with Secure Boot and vTPM        |
+| Fresh implicit OS disk    | `disk-opendots-pilot-scus-os`, FromImage, explicit32GiB Standard_LRS, platform-key encryption, retained/Detach                  |
+| Restored application disk | `disk-opendots-pilot-scus-data`, Copy from the SCUS data snapshot,32GiB Standard_LRS, LUN0 only, cachingNone/Detach             |
+| OS-audit disk             | `disk-opendots-pilot-scus-os-audit`, Copy from the SCUS OS snapshot,30GiB Standard_LRS/Linux/V2/TrustedLaunch, **Unattached**   |
+| VNet / subnet             | `vnet-opendots-pilot-scus` / `app`, sole10.43.0.0/24 subnet, no peering/custom DNS/routing/service overlays                     |
+| NIC                       | `nic-opendots-pilot-scus`, sole primary static10.43.0.4 IPv4 configuration                                                      |
+| NSG                       | `nsg-opendots-pilot-scus`, attached to both NIC and subnet; Internet TCP80/443 to10.43.0.4/32, then deny other inbound          |
+| Public IP                 | `pip-opendots-pilot-scus`, Standard/Regional staticIPv4, DNS label `opendots-7unu3az5tgmza-scus`, ResourceGroupReuse protection |
+
+The host template declares seven resources; the VM implicitly creates only the exact named fresh OS disk. The
+deployment's output-resource list must contain all seven declared IDs and may additionally contain that one OS
+disk ID. Runtime inventory must contain the named OS disk, and no other implicit resources or governance overlay
+is adopted. New host IDs become allowable target inventory only after the host intent. The seven declared
+resources plus the OS disk are read independently; UUIDs, creation times, ownership, attachment, retention,
+image/security/export settings, actual public IP/FQDN and network bindings are verified before host completion.
+Reported network resource GUIDs are pinned without inventing absent fields. Azure's actual FQDN is read and
+pinned, not synthesized from the DNS label or reuse hash.
+
+The image is exactly `Canonical:ubuntu-24_04-lts:server:24.04.202610160` in South Central US. Preflight checks its
+documented Linux/x64/V2 identity and Trusted Launch/NVMe compatibility. The marketplace GET schema does not
+establish a minimum disk size. The template explicitly requests a32GiB FromImage OS disk; real Provider validation
+and the reviewed exact what-if are the pre-creation gate. A successful validation reports:
+**“Provider validation accepted pinned-image 32GiB request; image minimum not independently measured.”** This is
+request acceptance, not a capacity or provisioning guarantee. Only successful dedicated Disk GET verification
+can report **“created OS reports 32GiB.”** Its size must be numeric32; missing/non-numeric/wrong authoritative size
+or SKU cannot complete. An omitted VM-reference size/SKU is not a substitute for the authoritative disk, and a
+present contradictory mirror fails. No auto-resize, image substitution or probe VM is available.
+
+Both restored disks remain DenyAll/publicDisabled/platform-key encrypted. B1 records the fresh implicit OS's
+AllowAll/publicEnabled defaults (or DenyAll/Disabled if already enforced) without modifying them; the defaults
+are **not anonymous access or a SAS grant**. Later export-setting drift cannot silently refresh the binding. Before B2 delivers any protected
+application/registry input, the fresh OS must be verified DenyAll/Disabled. Any required hardening PATCH is a
+separate reviewed, journaled capability, **not implemented or permitted in B1**.
+
+### Restored disk Copy lineage — distinct from Stage A CopyStart
+
+Restores require exact `createOption:Copy` and the corresponding SCUS snapshot ID. All four snapshots' recorded
+unique/family/root/security/creation metadata and availability are refreshed before submission and after creation,
+before accepting disk bindings. Both SCUS copies must still report numeric100 and accepted access state. The
+reviewed deterministic deployment, durable intent, prior name absence, exact inventory/output graph and new disk
+identity/creation/ownership/security checks are mandatory even when a provider source UID is absent.
+
+For a restored disk's `creationData.sourceUniqueId`, accept exactly:
+
+- omitted;
+- explicit `null`;
+- the immediate SCUS source snapshot's **own** `uniqueId`.
+
+Original-disk IDs, older/captured-snapshot IDs, cross-disk IDs, foreign UUIDs and empty/malformed values fail.
+Never use the source snapshot's `creationData.sourceUniqueId` as the expected value and never infer it from tags.
+The first successful completed binding records `sourceUniqueIdRepresentation:omitted|null|value` and the exact
+value when present under `stages.host.binding.disks.<kind>.creation`. Later representation/value drift fails;
+an incomplete provisioning response cannot establish final absence. No provider fields are filled or rewritten.
+Standard_LRS disk hydration percentage is not subjected to the snapshot-copy100% gate; known disk copy errors
+still fail. This contract does not change Stage A's separately approved CopyStart validator.
+
+### Separate model-role and bounded observations
+
+`model-role` deploys into the **explicit shared `rg-opendots-pilot`**, not the target compute RG. The existing
+Foundry account is an existing-resource scope, never a resource update. The only new assignment is
+`f38e4e56-1acc-5c13-9dc1-d17567962599`, Cognitive Services OpenAI User
+(`5e0bd9bd-7b93-4f28-af87-19fc36ad61bd`), scoped to `ai-opendots-7unu3az5tgmza`. Its `principalId` must be the
+actual host-bound new MI, with `principalType:ServicePrincipal`. There is no unresolved-principal what-if
+allowance. Fresh host identity drift rejects the proposal; a fixed existing untracked role is not adopted.
+The original assignment and all shared service configurations remain unchanged. Role readback is authorization
+metadata, **not proof that inference works**; no service token, image pull or model request is performed.
+
+After host binding, `status` performs a bounded GET-only observation. It checks the host binding, reads a fixed
+instance-view projection and rechecks VM identity. Output contains only sanitized power/provisioning state, agent
+version and bounded native handler names/versions/statuses. Missing handler evidence stays unavailable, not an
+invented empty ready set. No raw VM payload, diagnostic/SAS URL, message, protected settings or private key is
+returned. Observation does not save handler pins or qualify management, privacy, boot containment or app data.
+
+B1 can report `hostBound` and, after the separate verified role stage, `modelRoleAssigned`; it always reports
+`applicationActivated:false` and leaves guest qualification, fresh-OS export hardening and data audit pending.
+`audit`, `configure`, `activate`, source power, audit attach/detach, harden/export, extension and guest commands
+remain unavailable. B2 must establish actual target management and effective firmware/bootloader/initramfs/root
+selection containment before attaching the unknown-UUID OS copy. There is no boot workaround, copied source
+privacy approval, or B1 activation shortcut.
 
 ## Ambiguity and GET-only reconciliation
 
@@ -203,7 +338,7 @@ authoritative app data. Source and target must not become simultaneous applicati
 ```sh
 mkdir -p /tmp/opencode/opendots-scus-contracts
 "$HOME/.azure/bin/bicep" build infra/main.bicep --outfile /tmp/opencode/opendots-scus-contracts/original.json
-for stage in group capture copy; do
+for stage in group capture copy host model-role; do
   "$HOME/.azure/bin/bicep" build "infra/scus/$stage.bicep" --outfile "/tmp/opencode/opendots-scus-contracts/$stage.json"
 done
 PILOT_ARM_TEMPLATE=/tmp/opencode/opendots-scus-contracts/original.json \
@@ -213,8 +348,9 @@ python3 -B -m unittest discover -s deployment/azure/test -p '*_test.py'
 ```
 
 Run tests with credentials/artifacts masked and networking disabled; only synthetic temporary state is used.
-No original IaC, guest helper/wrapper or native-handler implementation changed. Shared scope-validation source
-changed, so the computed original transport hash changes naturally; preserve historical recorded hashes and
+The B1 tests also use local `ssh-keygen` only on synthetic key directories. No original IaC, guest helper/wrapper
+or native-handler implementation changed. Stage A's earlier shared scope-validator change altered the original
+computed transport hash; B1 does not rewrite that transport or historical recorded hashes. Preserve them and
 require fresh qualification for future guest work. This increment never constructs a target transport. Future
 target guest integration must cover profile/bundle dependencies in its transport hash and use new target-only
 privacy evidence; it cannot transplant the original approval or wrapper bindings.
@@ -226,6 +362,11 @@ fields and deployment validation semantics:
 - [Snapshots GET, API2025-01-02](https://learn.microsoft.com/rest/api/compute/snapshots/get?view=rest-compute-2025-01-02)
 - [Disks GET, including LastOwnershipUpdateTime](https://learn.microsoft.com/rest/api/compute/disks/get?view=rest-compute-2025-01-02)
 - [Provider deployment validation](https://learn.microsoft.com/rest/api/resources/deployments/validate?view=rest-resources-2025-04-01)
+- [Marketplace-image GET, API2025-11-01](https://learn.microsoft.com/rest/api/compute/virtual-machine-images/get?view=rest-compute-2025-11-01)
+- [Trusted Launch marketplace image feature checks](https://learn.microsoft.com/azure/virtual-machines/trusted-launch-faq)
+- [Resource-scoped RBAC in Bicep](https://learn.microsoft.com/azure/azure-resource-manager/bicep/scenarios-rbac)
+- [Role-assignment list REST](https://learn.microsoft.com/azure/role-based-access-control/role-assignments-list-rest)
+- [Native VM agent/handler instance-view fields](https://learn.microsoft.com/javascript/api/@azure/arm-compute/virtualmachineagentinstanceview?view=azure-node-latest)
 
-Actual provider compatibility/policy permission and live preservation success remain lead-owned verification.
-The new trusted-launch capture/copy request is never weakened in response to a provider denial.
+Actual provider compatibility, policy permission, B1 deployment and B2 application acceptance remain lead-owned
+verification. A provider denial never authorizes weakening security, changing images, adding resources or retrying writes.

@@ -46,6 +46,21 @@ const sharedServices = {
   ),
 };
 const targetGroup = `/subscriptions/${SCOPE.subscriptionId}/resourceGroups/rg-opendots-pilot-scus`;
+const targetResource = (type, name) => ({
+  name,
+  type,
+  id: `${targetGroup}/providers/${type}/${name}`,
+});
+const targetVm = targetResource(
+  'Microsoft.Compute/virtualMachines',
+  'vm-opendots-pilot-scus',
+);
+const targetVnet = targetResource(
+  'Microsoft.Network/virtualNetworks',
+  'vnet-opendots-pilot-scus',
+);
+// UUIDv5(DNS, 'opendots.pilot-scus-v1.model-role'); fixed across retries, never derived from a replacement identity.
+const modelRoleName = 'f38e4e56-1acc-5c13-9dc1-d17567962599';
 const snapshot = (name, location) => ({
   name,
   location,
@@ -76,14 +91,43 @@ export const SCUS_PROFILE = freeze({
     groupId: targetGroup,
     location: 'southcentralus',
     vm: {
-      name: 'vm-opendots-pilot-scus',
-      id: `${targetGroup}/providers/Microsoft.Compute/virtualMachines/vm-opendots-pilot-scus`,
+      ...targetVm,
+      admin: VM.admin,
       size: VM.size,
       image: structuredClone(VM.image),
       diskControllerType: 'NVMe',
       securityType: 'TrustedLaunch',
     },
+    disks: {
+      os: targetResource(
+        'Microsoft.Compute/disks',
+        'disk-opendots-pilot-scus-os',
+      ),
+      data: targetResource(
+        'Microsoft.Compute/disks',
+        'disk-opendots-pilot-scus-data',
+      ),
+      audit: targetResource(
+        'Microsoft.Compute/disks',
+        'disk-opendots-pilot-scus-os-audit',
+      ),
+    },
     network: {
+      vnet: targetVnet,
+      subnet: { name: 'app', id: `${targetVnet.id}/subnets/app` },
+      nic: targetResource(
+        'Microsoft.Network/networkInterfaces',
+        'nic-opendots-pilot-scus',
+      ),
+      nsg: targetResource(
+        'Microsoft.Network/networkSecurityGroups',
+        'nsg-opendots-pilot-scus',
+      ),
+      pip: targetResource(
+        'Microsoft.Network/publicIPAddresses',
+        'pip-opendots-pilot-scus',
+      ),
+      dnsLabel: `opendots-${SCOPE.suffix}-scus`,
       addressPrefix: '10.43.0.0/24',
       privateIpv4: '10.43.0.4',
       allocation: 'Static',
@@ -92,6 +136,12 @@ export const SCUS_PROFILE = freeze({
     },
   },
   sharedServices: structuredClone(sharedServices),
+  modelRole: {
+    name: modelRoleName,
+    id: `${sharedServices.foundry.id}/providers/Microsoft.Authorization/roleAssignments/${modelRoleName}`,
+    scope: sharedServices.foundry.id,
+    roleDefinitionId: `/subscriptions/${SCOPE.subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/5e0bd9bd-7b93-4f28-af87-19fc36ad61bd`,
+  },
   sourcePreservation: {
     profileId: 'original',
     groupId: GROUP_ID,
@@ -128,11 +178,29 @@ export const SCUS_PROFILE = freeze({
       deploymentName: 'opendots-scus-copy-v1',
       template: 'infra/scus/copy.bicep',
     },
+    host: {
+      scope: 'group',
+      deploymentName: 'opendots-scus-host-v1',
+      template: 'infra/scus/host.bicep',
+    },
+    'model-role': {
+      scope: 'group',
+      resourceGroup: sharedServices.resourceGroup,
+      groupId: GROUP_ID,
+      deploymentName: 'opendots-scus-model-role-v1',
+      template: 'infra/scus/model-role.bicep',
+    },
   },
   tags: { ...TAGS, profileId: 'pilot-scus-v1' },
   artifacts: {
     directory: 'artifacts/azure-pilot-scus',
     shared: 'artifacts/azure-pilot-shared',
+    hostKey: {
+      directory: 'host-key',
+      privateFile: 'id_ed25519',
+      publicFile: 'id_ed25519.pub',
+    },
+    hostPublicParameters: 'host-public-parameters.json',
   },
   guestBundle: { available: false, version: 'restore-only-v2' },
 });

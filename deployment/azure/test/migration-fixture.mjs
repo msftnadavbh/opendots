@@ -3,10 +3,16 @@ import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { SCUS_PROFILE } from '../profiles.mjs';
-import { SCOPE, VM } from '../scope.mjs';
+import { SCOPE, VM, TAGS } from '../scope.mjs';
 import { createAz } from '../cloud.mjs';
 import { openMigrationStore, hashObject, sha256 } from '../migration-state.mjs';
 import { migrationController, migrationMain } from '../migration.mjs';
+import {
+  hostImageId,
+  hostImageUrl,
+  modelRoleListUrl,
+  HOST_OBSERVATION_QUERY,
+} from '../migration-host.mjs';
 import {
   desiredResources,
   deploymentId,
@@ -22,11 +28,11 @@ import {
 
 assert(
   process.env.PILOT_SCUS_TEMPLATE_DIR,
-  'Compile all three infra/scus templates and set PILOT_SCUS_TEMPLATE_DIR; never skip this contract.',
+  'Compile all five infra/scus templates and set PILOT_SCUS_TEMPLATE_DIR; never skip this contract.',
 );
 export const compiled = Object.fromEntries(
   await Promise.all(
-    ['group', 'capture', 'copy'].map(async (stage) => [
+    ['group', 'capture', 'copy', 'host', 'model-role'].map(async (stage) => [
       stage,
       await readFile(
         join(process.env.PILOT_SCUS_TEMPLATE_DIR, `${stage}.json`),
@@ -79,6 +85,19 @@ export async function migrationFixture(t) {
   r.os.properties.networkAccessPolicy = 'AllowAll';
   r.os.properties.publicNetworkAccess = 'Enabled';
   r.disk.tags = {};
+  r.foundry = {
+    id: SCUS_PROFILE.sharedServices.foundry.id,
+    name: SCUS_PROFILE.sharedServices.foundry.name,
+    type: 'Microsoft.CognitiveServices/accounts',
+    location: SCOPE.location,
+    tags: { ...TAGS },
+    properties: { provisioningState: 'Succeeded', disableLocalAuth: true },
+  };
+  const inheritedRole = (scope) => ({
+    id: `${scope}/providers/Microsoft.Authorization/roleAssignments/${randomUUID()}`,
+    type: 'Microsoft.Authorization/roleAssignments',
+    properties: { scope },
+  });
   const f = {
     root,
     original,
@@ -86,6 +105,17 @@ export async function migrationFixture(t) {
     files,
     source: r,
     resources: new Map(),
+    roles: new Map(),
+    inheritedRoles: [
+      ...Array.from({ length: 21 }, () =>
+        inheritedRole(`/subscriptions/${SCOPE.subscriptionId}`),
+      ),
+      ...Array.from({ length: 23 }, (_, index) =>
+        inheritedRole(
+          `/providers/Microsoft.Management/managementGroups/mg-fixture-${index}`,
+        ),
+      ),
+    ],
     deployments: new Map(),
     group: undefined,
     power: 'PowerState/deallocated',
@@ -97,6 +127,37 @@ export async function migrationFixture(t) {
     completionPercent: 100,
     snapshotAccessState: { capture: 'Available', copy: 'Available' },
     copyLineage: { os: 'captured-snapshot', data: 'captured-snapshot' },
+    restoreLineage: { data: 'value', audit: 'value' },
+    hostExtraOutputOs: true,
+    image: {
+      id: hostImageId(SCUS_PROFILE),
+      name: SCUS_PROFILE.compute.vm.image.version,
+      location: SCUS_PROFILE.compute.location,
+      properties: {
+        architecture: 'x64',
+        hyperVGeneration: 'V2',
+        osDiskImage: { operatingSystem: 'Linux' },
+        features: [
+          { name: 'SecurityType', value: 'TrustedLaunchSupported' },
+          { name: 'DiskControllerTypes', value: 'SCSI, NVMe' },
+        ],
+      },
+    },
+    targetView: {
+      statuses: [{ code: 'PowerState/running', level: 'Info' }],
+      agent: {
+        version: '2.16.0.2',
+        statuses: [{ code: 'ProvisioningState/succeeded', level: 'Info' }],
+        handlers: [
+          {
+            name: 'Microsoft.CPlat.Core.RunCommandHandlerLinux',
+            version: '1.3.7',
+            code: 'ProvisioningState/succeeded',
+            level: 'Info',
+          },
+        ],
+      },
+    },
     createFault: undefined,
     afterCreate: undefined,
     validationMutation: undefined,
@@ -131,12 +192,34 @@ export async function migrationFixture(t) {
     let value;
     const groupName = args[args.indexOf('--resource-group') + 1];
     if (args[0] === 'account') value = f.account;
-    else if (args[0] === 'rest') value = f.principal;
-    else if (args[0] === 'group')
+    else if (args[0] === 'rest') {
+      const url = args[args.indexOf('--url') + 1];
+      if (url.startsWith('https://graph.microsoft.com/')) value = f.principal;
+      else if (url === hostImageUrl(SCUS_PROFILE)) value = f.image;
+      else {
+        assert.equal(url, modelRoleListUrl(SCUS_PROFILE));
+        value = {
+          value: [
+            {
+              ...f.source.role,
+              type: 'Microsoft.Authorization/roleAssignments',
+            },
+            ...f.inheritedRoles,
+            ...f.roles.values(),
+          ],
+          ...(f.roleNextLink ? { nextLink: f.roleNextLink } : {}),
+        };
+        if (f.roleInventoryResponse) value = f.roleInventoryResponse(value);
+      }
+    } else if (args[0] === 'group')
       value = args[1] === 'exists' ? !!f.group : f.group;
-    else if (args[0] === 'vm')
-      value = [{ code: 'ProvisioningState/succeeded' }, { code: f.power }];
-    else if (args[0] === 'resource' && args[1] === 'list') {
+    else if (args[0] === 'vm') {
+      if (args[3] === SCUS_PROFILE.compute.vm.id) {
+        assert.equal(args[5], HOST_OBSERVATION_QUERY);
+        value = f.targetView;
+      } else
+        value = [{ code: 'ProvisioningState/succeeded' }, { code: f.power }];
+    } else if (args[0] === 'resource' && args[1] === 'list') {
       value = inventory(
         groupName === SCOPE.resourceGroup
           ? Object.values(f.source).filter((item) => item !== f.source.role)
@@ -148,7 +231,8 @@ export async function migrationFixture(t) {
       if (f.readFault === id) throw new Error('FAKE-PRIVATE-PROVIDER-ERROR');
       value =
         Object.values(f.source).find((item) => item.id === id) ??
-        f.resources.get(id);
+        f.resources.get(id) ??
+        f.roles.get(id);
       assert(value, `Unexpected fixture resource read: ${id}`);
     } else if (args[0] === 'deployment') {
       if (args[2] === 'list') {
@@ -209,7 +293,7 @@ export async function migrationFixture(t) {
               changes: specs.map((item) => ({
                 resourceId: item.id,
                 changeType: 'Create',
-                after: item,
+                after: structuredClone(item),
               })),
             };
             f.whatIfMutation?.(value);
@@ -229,7 +313,14 @@ export async function migrationFixture(t) {
               local.stages[stage].intent.request.parameters,
               params,
             );
-            assert.equal(template.resources.length, stage === 'group' ? 1 : 2);
+            assert.equal(
+              template.resources.length,
+              stage === 'host'
+                ? 7
+                : ['group', 'model-role'].includes(stage)
+                  ? 1
+                  : 2,
+            );
             f.creates.push(stage);
             if (f.createFault === 'before')
               throw new Error('FAKE-PRIVATE-UNKNOWN-SUBMISSION');
@@ -239,7 +330,70 @@ export async function migrationFixture(t) {
                   ...spec,
                   properties: { provisioningState: 'Succeeded' },
                 };
-              else {
+              else if (stage === 'model-role') {
+                assert.equal(
+                  params.principalId.value,
+                  local.stages.host.binding.vm.principalId,
+                );
+                f.roles.set(spec.id, {
+                  ...structuredClone(spec),
+                  properties: {
+                    ...spec.properties,
+                    scope: SCUS_PROFILE.modelRole.scope,
+                  },
+                });
+              } else if (stage === 'host') {
+                const value = {
+                  ...structuredClone(spec),
+                  properties: {
+                    ...structuredClone(spec.properties),
+                    provisioningState: 'Succeeded',
+                  },
+                };
+                const { disks: d, network: n, vm } = SCUS_PROFILE.compute;
+                if (spec.type === 'Microsoft.Compute/disks') {
+                  const kind = spec.id === d.audit.id ? 'audit' : 'data';
+                  const source = f.resources.get(
+                    spec.properties.creationData.sourceResourceId,
+                  );
+                  assert(source);
+                  if (f.restoreLineage[kind] !== 'omitted')
+                    value.properties.creationData.sourceUniqueId =
+                      f.restoreLineage[kind] === 'null'
+                        ? null
+                        : source.properties.uniqueId;
+                  value.properties.uniqueId = randomUUID();
+                  value.properties.timeCreated = new Date().toISOString();
+                  value.managedBy = kind === 'audit' ? null : vm.id;
+                  value.properties.diskState =
+                    kind === 'audit' ? 'Unattached' : 'Attached';
+                } else if (spec.type === 'Microsoft.Compute/virtualMachines') {
+                  value.identity = {
+                    type: 'SystemAssigned',
+                    principalId: randomUUID(),
+                    tenantId: SCOPE.tenantId,
+                  };
+                  value.properties.vmId = randomUUID();
+                  value.properties.storageProfile.osDisk.managedDisk = {
+                    id: d.os.id,
+                  };
+                } else {
+                  value.properties.resourceGuid = randomUUID();
+                  if (spec.id === n.vnet.id)
+                    value.properties.subnets[0].id = n.subnet.id;
+                  if (spec.id === n.nic.id)
+                    value.properties.virtualMachine = { id: vm.id };
+                  if (spec.id === n.nsg.id) {
+                    value.properties.networkInterfaces = [{ id: n.nic.id }];
+                    value.properties.subnets = [{ id: n.subnet.id }];
+                  }
+                  if (spec.id === n.pip.id) {
+                    value.properties.ipAddress = '20.50.60.70';
+                    value.properties.dnsSettings.fqdn = `${n.dnsLabel}.b1fixture.southcentralus.sysgen.cloudapp.azure.com`;
+                  }
+                }
+                f.resources.set(spec.id, value);
+              } else {
                 const sourceId = spec.properties.creationData.sourceResourceId;
                 const source =
                   Object.values(f.source).find(
@@ -277,6 +431,33 @@ export async function migrationFixture(t) {
                 });
               }
             }
+            if (stage === 'host') {
+              const d = SCUS_PROFILE.compute.disks.os;
+              f.resources.set(d.id, {
+                ...d,
+                location: SCUS_PROFILE.compute.location,
+                tags: {},
+                sku: { name: 'Standard_LRS' },
+                managedBy: SCUS_PROFILE.compute.vm.id,
+                properties: {
+                  provisioningState: 'Succeeded',
+                  uniqueId: randomUUID(),
+                  timeCreated: new Date().toISOString(),
+                  diskSizeGB: 32,
+                  diskState: 'Attached',
+                  osType: 'Linux',
+                  hyperVGeneration: 'V2',
+                  securityProfile: { securityType: 'TrustedLaunch' },
+                  encryption: { type: 'EncryptionAtRestWithPlatformKey' },
+                  networkAccessPolicy: 'AllowAll',
+                  publicNetworkAccess: 'Enabled',
+                  creationData: {
+                    createOption: 'FromImage',
+                    imageReference: { id: hostImageId(SCUS_PROFILE) },
+                  },
+                },
+              });
+            }
             f.deployments.set(stage, {
               id: deploymentId(SCUS_PROFILE, stage),
               name,
@@ -288,7 +469,12 @@ export async function migrationFixture(t) {
                 templateHash: providerHash,
                 correlationId: randomUUID(),
                 timestamp: new Date().toISOString(),
-                outputResources: stageIds(SCUS_PROFILE, stage).map((id) => ({
+                outputResources: [
+                  ...stageIds(SCUS_PROFILE, stage),
+                  ...(stage === 'host' && f.hostExtraOutputOs
+                    ? [SCUS_PROFILE.compute.disks.os.id]
+                    : []),
+                ].map((id) => ({
                   id,
                 })),
               },
@@ -333,6 +519,7 @@ export async function migrationFixture(t) {
     await f.open();
     await f.store.prepare();
   };
+  f.prepareHost = () => f.store.prepareHost();
   f.review = async (stage) => {
     const state = await f.diskState(),
       proof = state.stages[stage].validation;

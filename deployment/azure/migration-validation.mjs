@@ -3,6 +3,14 @@ import { SCOPE, requirePilot } from './scope.mjs';
 import { SCUS_PROFILE, assertProfile } from './profiles.mjs';
 import { assertVmConfiguration } from './vm-state.mjs';
 import { hashObject } from './migration-state.mjs';
+import {
+  isHostStage,
+  hostDescriptors,
+  hostParameters,
+  hostResources,
+  assertHostTemplate,
+  assertHostWhatIf,
+} from './migration-host.mjs';
 
 const sameId = (a, b) =>
   typeof a === 'string' && a.toLowerCase() === b.toLowerCase();
@@ -18,21 +26,45 @@ export function requireStage(profile, stage) {
   assertProfile(profile);
   requirePilot(
     profile === SCUS_PROFILE && Object.hasOwn(profile.stages, stage),
-    'Only target group/capture/copy preservation stages exist; host/audit/configure/activate and guest commands are unavailable.',
+    'Only target group/capture/copy/host/model-role stages exist; audit/configure/activate and guest commands are unavailable.',
   );
   return profile.stages[stage];
 }
 export function deploymentId(profile, stage) {
   const plan = requireStage(profile, stage);
-  return `${plan.scope === 'sub' ? `/subscriptions/${profile.account.subscriptionId}` : profile.compute.groupId}/providers/Microsoft.Resources/deployments/${plan.deploymentName}`;
+  return `${plan.scope === 'sub' ? `/subscriptions/${profile.account.subscriptionId}` : (plan.groupId ?? profile.compute.groupId)}/providers/Microsoft.Resources/deployments/${plan.deploymentName}`;
 }
-export const stageIds = (profile, stage) =>
-  stage === 'group'
+export const stageResourceGroup = (profile, stage) =>
+  requireStage(profile, stage).resourceGroup ?? profile.compute.resourceGroup;
+export const stageIds = (profile, stage) => {
+  requireStage(profile, stage);
+  if (stage === 'host') return hostDescriptors(profile).map((r) => r.id);
+  if (stage === 'model-role') return [profile.modelRole.id];
+  return stage === 'group'
     ? [profile.compute.groupId]
     : (stage === 'capture'
         ? ['sourceOs', 'sourceData']
         : ['targetOs', 'targetData']
       ).map((key) => profile.sourcePreservation.snapshots[key].id);
+};
+export function assertStageOutputs(items, profile, stage) {
+  const declared = stageIds(profile, stage).map((id) => id.toLowerCase());
+  const allowed = [
+    ...declared,
+    ...(stage === 'host' ? [profile.compute.disks.os.id.toLowerCase()] : []),
+  ];
+  requirePilot(
+    Array.isArray(items) && items.every((r) => typeof r?.id === 'string'),
+    'Deployment output-resource graph is unavailable.',
+  );
+  const actual = items.map((r) => r.id.toLowerCase());
+  requirePilot(
+    new Set(actual).size === actual.length &&
+      declared.every((id) => actual.includes(id)) &&
+      actual.every((id) => allowed.includes(id)),
+    'Deployment output-resource graph differs; only host may additionally report its exact implicit fresh OS disk.',
+  );
+}
 export function stageTags(profile, state, stage) {
   return {
     ...profile.tags,
@@ -44,6 +76,7 @@ export function stageTags(profile, state, stage) {
 export function desiredResources(profile, state, stage) {
   requireStage(profile, stage);
   const tags = stageTags(profile, state, stage);
+  if (isHostStage(stage)) return hostResources(profile, state, stage, tags);
   if (stage === 'group')
     return [
       {
@@ -96,6 +129,7 @@ export function desiredResources(profile, state, stage) {
   });
 }
 export function stageParameters(profile, state, stage) {
+  if (isHostStage(stage)) return hostParameters(profile, state, stage);
   const resources = desiredResources(profile, state, stage);
   return {
     migrationId: { value: state.migrationId },
@@ -112,6 +146,14 @@ export function stageParameters(profile, state, stage) {
 }
 
 export function assertStageTemplate(profile, state, stage, template) {
+  if (isHostStage(stage))
+    return assertHostTemplate(
+      profile,
+      state,
+      stage,
+      template,
+      stageTags(profile, state, stage),
+    );
   const expected = desiredResources(profile, state, stage);
   const values = Object.fromEntries(
     Object.keys(stageParameters(profile, state, stage)).map((key) => [
@@ -498,6 +540,15 @@ export function assertWhatIf(result, profile, state, stage, existingIds) {
   for (const item of result.changes) {
     const spec = expected.find((r) => sameId(item.resourceId, r.id));
     if (spec) {
+      if (isHostStage(stage)) {
+        requirePilot(
+          item.changeType === 'Create' && !created.has(spec.id) && item.after,
+          'B1 what-if must contain each exact new resource once, without adoption.',
+        );
+        assertHostWhatIf(item.after, spec, profile, stage);
+        created.add(spec.id);
+        continue;
+      }
       requirePilot(
         item.changeType === 'Create' &&
           !created.has(spec.id) &&
