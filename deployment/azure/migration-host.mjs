@@ -10,6 +10,9 @@ const sameId = (a, b) =>
   a.toLowerCase() === b.toLowerCase();
 const encryption = Object.freeze({ type: 'EncryptionAtRestWithPlatformKey' });
 const diskSecurity = Object.freeze({ securityType: 'TrustedLaunch' });
+const pipIpTags = Object.freeze([
+  Object.freeze({ ipTagType: 'FirstPartyUsage', tag: '/Unprivileged' }),
+]);
 const vmSecurity = Object.freeze({
   ...diskSecurity,
   uefiSettings: Object.freeze({ secureBootEnabled: true, vTpmEnabled: true }),
@@ -175,6 +178,7 @@ function graph(profile, stage, values, tags) {
       {
         publicIPAllocationMethod: 'Static',
         publicIPAddressVersion: 'IPv4',
+        ipTags: pipIpTags,
         dnsSettings: {
           domainNameLabel: n.dnsLabel,
           domainNameLabelScope: 'ResourceGroupReuse',
@@ -421,7 +425,7 @@ function noGuestExecution(value) {
     !p?.hostGroup
   );
 }
-function noNetworkOverlays(value) {
+function noNetworkOverlays(value, profile) {
   const p = value.properties;
   return (
     !p?.dnsSettings?.dnsServers?.length &&
@@ -431,7 +435,11 @@ function noNetworkOverlays(value) {
     !p?.publicIPPrefix &&
     !p?.linkedPublicIPAddress &&
     !p?.servicePublicIPAddress &&
-    !p?.ipTags?.length &&
+    (sameId(value.id, profile.compute.network.pip.id) &&
+    sameId(value.type, profile.compute.network.pip.type)
+      ? isDeepStrictEqual(p?.ipTags, pipIpTags)
+      : p?.ipTags == null ||
+        (Array.isArray(p.ipTags) && p.ipTags.length === 0)) &&
     !p?.flowLogs?.length &&
     (p?.subnets ?? []).every(
       (s) =>
@@ -471,7 +479,10 @@ export function assertHostWhatIf(after, spec, profile, stage) {
           (!spec.sku || matches(after.sku, spec.sku)) &&
           (!spec.identity || matches(after.identity, spec.identity)) &&
           (!spec.type.startsWith('Microsoft.Network/') ||
-            noNetworkOverlays(after)) &&
+            noNetworkOverlays(
+              { ...after, id: after.id ?? spec.id },
+              profile,
+            )) &&
           (spec.type !== 'Microsoft.Compute/virtualMachines' ||
             noGuestExecution(after))),
     'B1 what-if differs from the exact host request or actual-principal, account-scoped role; no unresolved placeholders or guest execution.',
@@ -655,8 +666,8 @@ function assertNetwork(values, profile, expected) {
       'Target network settings differ from the exact static web-only topology.',
     );
   requirePilot(
-    [nsg, vnet, pip, nic].every(noNetworkOverlays),
-    'Target network has unapproved DNS, routing, peering or service overlays.',
+    [nsg, vnet, pip, nic].every((value) => noNetworkOverlays(value, profile)),
+    'Target network has unapproved DNS, routing, peering, service overlays or IP classification.',
   );
   const np = nic.properties,
     vp = vnet.properties,
@@ -738,6 +749,7 @@ function assertNetwork(values, profile, expected) {
         : {}),
     };
   }
+  identities.pip.ipTags = structuredClone(pp.ipTags);
   return {
     resources: identities,
     subnetId: n.subnet.id,

@@ -83,6 +83,9 @@ resource pip 'Microsoft.Network/publicIPAddresses@2025-05-01' = if (authorized) 
   properties: {
     publicIPAllocationMethod: 'Static'
     publicIPAddressVersion: 'IPv4'
+    ipTags: [
+      { ipTagType: 'FirstPartyUsage', tag: '/Unprivileged' }
+    ]
     dnsSettings: {
       domainNameLabel: 'opendots-7unu3az5tgmza-scus'
       domainNameLabelScope: 'ResourceGroupReuse'

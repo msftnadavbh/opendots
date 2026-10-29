@@ -15,6 +15,8 @@ import {
 } from '../migration-host.mjs';
 import { migrationFixture } from './migration-fixture.mjs';
 
+const pipIpTags = [{ ipTagType: 'FirstPartyUsage', tag: '/Unprivileged' }];
+
 async function preserved(t) {
   const f = await migrationFixture(t);
   await f.prepare();
@@ -66,6 +68,8 @@ test('working finite B1 flow uses a fresh private key, binds host and implicit O
   assert.equal(bound.disks.audit.managedBy, null);
   assert.equal(bound.disks.audit.sizeGiB, 30);
   assert.equal(bound.network.privateIpv4, '10.43.0.4');
+  assert.deepEqual(bound.network.resources.pip.ipTags, pipIpTags);
+  assert.deepEqual(resource(f, 'pip').properties.ipTags, pipIpTags);
   const role = await f.stage('model-role');
   assert.equal(role.status, 'complete');
   assert.equal(role.modelRoleAssigned, true);
@@ -107,6 +111,7 @@ test('working finite B1 flow uses a fresh private key, binds host and implicit O
     assert.equal((await f.controller.reconcile(stage)).status, 'complete');
     await assert.rejects(f.controller.apply(stage), /durable intent/);
   }
+  assert.deepEqual((await f.diskState()).stages.host.binding, bound);
   assert.deepEqual(f.creates, [
     'group',
     'capture',
@@ -477,6 +482,23 @@ const drift = {
   'public DNS suffix drift': (f) => {
     resource(f, 'pip').properties.dnsSettings.fqdn = 'foreign.example';
   },
+  'public IP prefix overlay': (f) => {
+    resource(f, 'pip').properties.publicIPPrefix = { id: 'foreign' };
+  },
+  'linked public IP overlay': (f) => {
+    resource(f, 'pip').properties.linkedPublicIPAddress = { id: 'foreign' };
+  },
+  'service public IP overlay': (f) => {
+    resource(f, 'pip').properties.servicePublicIPAddress = { id: 'foreign' };
+  },
+  'public IP NAT overlay': (f) => {
+    resource(f, 'pip').properties.natGateway = { id: 'foreign' };
+  },
+  'subnet routing overlay': (f) => {
+    resource(f, 'vnet').properties.subnets[0].properties.routeTable = {
+      id: 'foreign',
+    };
+  },
 };
 for (const [name, mutate] of Object.entries(drift))
   test(`host binding rejects ${name} without accepting partial bindings or retrying`, async (t) => {
@@ -489,6 +511,97 @@ for (const [name, mutate] of Object.entries(drift))
     await assert.rejects(f.controller.apply('host'), /durable intent/);
     assert.deepEqual(f.creates, ['group', 'capture', 'copy', 'host']);
   });
+
+test('host readback requires exact target PIP classification and no tags or malformed collections on other network resources, without corrective writes', async (t) => {
+  const f = await pendingHost(t);
+  const intent = (await f.diskState()).stages.host.intent;
+  const invalid = [
+    undefined,
+    null,
+    [],
+    {},
+    false,
+    0,
+    '',
+    { length: 0 },
+    [null],
+    ['FirstPartyUsage:/Unprivileged'],
+    ...['RoutingPreference', 'firstpartyusage', null, 1].map((ipTagType) => [
+      { ...pipIpTags[0], ipTagType },
+    ]),
+    ...['/Privileged', '/unprivileged', null, 1].map((tag) => [
+      { ...pipIpTags[0], tag },
+    ]),
+    [...pipIpTags, ...pipIpTags],
+    [...pipIpTags, { ipTagType: 'RoutingPreference', tag: 'Internet' }],
+    [{ ...pipIpTags[0], extra: 'unapproved' }],
+  ];
+  const start = f.calls.length;
+  for (const ipTags of invalid) {
+    const p = resource(f, 'pip').properties;
+    if (ipTags === undefined) delete p.ipTags;
+    else p.ipTags = structuredClone(ipTags);
+    const observed = structuredClone(p);
+    await assert.rejects(f.controller.reconcile('host'), /network/);
+    const state = await f.diskState();
+    assert.deepEqual(state.stages.host.intent, intent);
+    assert(!state.stages.host.binding);
+    assert.deepEqual(p, observed, 'never fill or rewrite provider fields');
+  }
+  resource(f, 'pip').properties.ipTags = structuredClone(pipIpTags);
+  for (const kind of ['nic', 'vnet', 'nsg']) {
+    const p = resource(f, kind).properties;
+    for (const ipTags of [pipIpTags, {}, { length: 0 }, '', false, 0]) {
+      p.ipTags = structuredClone(ipTags);
+      await assert.rejects(f.controller.reconcile('host'), /network/);
+      const state = await f.diskState();
+      assert.deepEqual(state.stages.host.intent, intent);
+      assert(!state.stages.host.binding);
+    }
+    delete p.ipTags;
+  }
+  await assert.rejects(f.controller.apply('host'), /durable intent/);
+  assert(
+    !f.calls
+      .slice(start)
+      .some((args) => ['validate', 'what-if', 'create'].includes(args[2])),
+  );
+  for (const [kind, ipTags] of [
+    ['nic', null],
+    ['vnet', []],
+  ])
+    resource(f, kind).properties.ipTags = ipTags;
+  assert.equal((await f.controller.reconcile('host')).status, 'complete');
+  assert.deepEqual(
+    (await f.diskState()).stages.host.binding.network.resources.pip.ipTags,
+    pipIpTags,
+  );
+  assert.deepEqual(f.creates, ['group', 'capture', 'copy', 'host']);
+});
+
+test('completed PIP classification cannot drift or refresh its pins on reconcile or dependent role validation', async (t) => {
+  const f = await preserved(t);
+  await f.prepareHost();
+  await f.stage('host');
+  const before = (await f.diskState()).stages.host;
+  for (const ipTags of [
+    undefined,
+    null,
+    [],
+    [{ ...pipIpTags[0], tag: '/Privileged' }],
+    [...pipIpTags, { ipTagType: 'RoutingPreference', tag: 'Internet' }],
+    [{ ...pipIpTags[0], extra: 'unapproved' }],
+  ]) {
+    const p = resource(f, 'pip').properties;
+    if (ipTags === undefined) delete p.ipTags;
+    else p.ipTags = structuredClone(ipTags);
+    await assert.rejects(f.controller.reconcile('host'), /network/);
+    await assert.rejects(f.controller.validate('model-role'), /network/);
+    assert.deepEqual((await f.diskState()).stages.host, before);
+  }
+  assert(!(await f.diskState()).stages['model-role']?.intent);
+  assert.deepEqual(f.creates, ['group', 'capture', 'copy', 'host']);
+});
 
 test('missing optional VM disk mirrors and network GUIDs do not replace authoritative disk requirements', async (t) => {
   const f = await pendingHost(t);

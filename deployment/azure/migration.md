@@ -255,6 +255,16 @@ image/security/export settings, actual public IP/FQDN and network bindings are v
 Reported network resource GUIDs are pinned without inventing absent fields. Azure's actual FQDN is read and
 pinned, not synthesized from the DNS label or reuse hash.
 
+Only the exact target public IP declares and accepts `ipTags:[{ipTagType:'FirstPartyUsage',tag:'/Unprivileged'}]`,
+as required by the enforced custom `PublicIPAddress_Tags_Append` policy. This is mandatory classification,
+not an exemption or permission to adopt arbitrary policy overlays; it does not establish firewall or routing
+privileges. The [Network2025-05-01 schema](https://learn.microsoft.com/azure/templates/microsoft.network/2025-05-01/publicipaddresses)
+documents `ipTags`/`FirstPartyUsage`; the exact `/Unprivileged` requirement comes from that custom policy.
+What-if and completed readback require that exact one-object array, including its exact fields and case.
+Verified provider values are pinned at `stages.host.binding.network.resources.pip.ipTags`; missing values are
+never filled, and later classification drift stops without rebinding or corrective writes. Other network
+resources still reject IP tags; ownership tags and all DNS/routing/prefix/peering/attachment guards are unchanged.
+
 The image is exactly `Canonical:ubuntu-24_04-lts:server:24.04.202610160` in South Central US. Preflight checks its
 documented Linux/x64/V2 identity and Trusted Launch/NVMe compatibility. The marketplace GET schema does not
 establish a minimum disk size. The template explicitly requests a32GiB FromImage OS disk; real Provider validation
