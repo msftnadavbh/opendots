@@ -118,6 +118,27 @@ export function assertEnvironment(env = process.env) {
     ),
     'Environment overrides cannot change the authorized pilot scope.',
   );
+  assertSafeEnvironment(env);
+}
+
+export function assertAccountEnvironment(env = process.env) {
+  const pinned = {
+    AZURE_TENANT_ID: SCOPE.tenantId,
+    AZURE_SUBSCRIPTION_ID: SCOPE.subscriptionId,
+    AZURE_AUTHORITY_HOST: 'https://login.microsoftonline.com',
+    AZURE_SANDBOX_GROUP: SCOPE.sandboxGroupName,
+    AZURE_SANDBOX_ENDPOINT: SCOPE.dataPlaneEndpoint,
+  };
+  requirePilot(
+    Object.entries(pinned).every(
+      ([key, value]) => !env[key] || env[key] === value,
+    ),
+    'Environment overrides cannot change the authorized pilot account or shared services.',
+  );
+  assertSafeEnvironment(env);
+}
+
+function assertSafeEnvironment(env) {
   requirePilot(
     !env.AZURE_LOG_LEVEL &&
       !env.AZURE_CORE_LOG_LEVEL &&

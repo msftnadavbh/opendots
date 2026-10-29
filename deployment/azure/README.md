@@ -12,6 +12,17 @@ guest eligibility is still unknown. This transport fix authorizes no power start
 Do not change tags/schedules or run a restart loop.
 This document and local fixture results are not live authorization or acceptance evidence.
 
+The separately approved South Central US preservation increment is available through the explicit
+`--profile pilot-scus-v1` selector. See [South Central US preservation](migration.md) for the finite
+group/capture/copy procedure, private review contract, source/copy lineage and GET-only reconciliation.
+It does not deploy a target VM or implement host/audit/configuration/activation. The original profile
+remains the default, with its original state, resources and guards; no source records are migrated in place.
+Preservation readiness requires explicit snapshot access availability as well as provisioning/copy completion.
+The preservation lane authenticates before its durable create-intent callback, recovers only exact planned local
+archive publication states, and fingerprints only the original VM/OS/data inventory records while still checking
+the full source inventory. See the migration runbook for CopyStart UID compatibility and retained uncertainty;
+independent review and lead verification remain required before any live caller.
+
 The recorded drift includes both original disks at `Standard_LRS`, absent data-disk tags, and
 a governance-created NSG on the application subnet. The fixed existing-resource lane below targets
 the separately authorized **post-change** `opendots-web` rule, not the earlier empty/default-deny profile.
@@ -85,7 +96,13 @@ Compile and execute the mandatory operator/ARM contract, then the mocked disk te
 set -eu
 mkdir -p -m 700 /tmp/opencode
 "$HOME/.azure/bin/bicep" build infra/main.bicep --outfile /tmp/opencode/opendots-pilot-arm.json
-PILOT_ARM_TEMPLATE=/tmp/opencode/opendots-pilot-arm.json npm --prefix deployment/azure test
+mkdir -p -m 700 /tmp/opencode/opendots-scus-contracts
+for stage in group capture copy; do
+  "$HOME/.azure/bin/bicep" build "infra/scus/$stage.bicep" --outfile "/tmp/opencode/opendots-scus-contracts/$stage.json"
+done
+PILOT_ARM_TEMPLATE=/tmp/opencode/opendots-pilot-arm.json \
+PILOT_SCUS_TEMPLATE_DIR=/tmp/opencode/opendots-scus-contracts \
+npm --prefix deployment/azure test
 python3 -B -m unittest discover -s deployment/azure/test -p '*_test.py'
 ```
 
@@ -94,6 +111,8 @@ the full pilot graph, including account-scoped roles, Entra-only auth, the retai
 NVMe/disk retention, exactly two NSG rules with no SSH allowance, historical public parameters,
 no unexpected resources, and no production imports. Managed Run Command is deliberately **not** an ARM
 deployment resource: protected inputs must never enter deployment history.
+The preservation tests also require `PILOT_SCUS_TEMPLATE_DIR`; the three new compiled graphs are mandatory,
+not skipped when testing the original operator regressions. Compiling them performs no Azure operation.
 Disk tests mock all device commands; they never format a host device.
 
 Run full app tests, typecheck, lint, formatting and build in Node24 with the real `.env` masked.

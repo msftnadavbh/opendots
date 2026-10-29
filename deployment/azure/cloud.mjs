@@ -1,11 +1,13 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { isDeepStrictEqual } from 'node:util';
 import {
   SCOPE,
   GROUP_ID,
   PilotError,
   assertAccount,
   assertEnvironment,
+  assertAccountEnvironment,
   assertOwned,
   requirePilot,
   VM,
@@ -18,6 +20,7 @@ import {
   assertKnownManagedCommand,
   assertManagedHandler,
 } from './run-command.mjs';
+import { ORIGINAL_PROFILE, SCUS_PROFILE, assertProfile } from './profiles.mjs';
 
 const execute = promisify(execFile);
 // Azure CLI rejects get-access-token when tenant and subscription are both supplied.
@@ -26,33 +29,232 @@ export const SANDBOX_CREDENTIAL_OPTIONS = Object.freeze({
   additionallyAllowedTenants: [],
   processTimeoutInMs: 30_000,
 });
-export function createAz(run = execute) {
-  assertEnvironment();
-  const read = async (args, { signal, timeoutMs = 20 * 60_000 } = {}) => {
+export function assertProfileEnvironment(profile, env = process.env) {
+  assertProfile(profile);
+  if (profile === ORIGINAL_PROFILE) return assertEnvironment(env);
+  assertAccountEnvironment(env);
+  const pinned = {
+    AZURE_RESOURCE_GROUP: profile.compute.resourceGroup,
+    AZURE_REGION: profile.compute.location,
+    AZURE_LOCATION: profile.compute.location,
+  };
+  requirePilot(
+    Object.entries(pinned).every(
+      ([key, value]) => !env[key] || env[key] === value,
+    ),
+    'Environment conflicts with the explicitly selected compute profile; environment variables cannot select a profile.',
+  );
+}
+
+export function createAz(run = execute, profile = ORIGINAL_PROFILE) {
+  assertProfileEnvironment(profile);
+  const principalArgs = [
+    'rest',
+    '--method',
+    'get',
+    '--url',
+    'https://graph.microsoft.com/v1.0/me?$select=id',
+    '--resource',
+    'https://graph.microsoft.com/',
+    '--query',
+    'id',
+  ];
+  const allowed = (args, writing) => {
+    if (profile === ORIGINAL_PROFILE) return;
+    const stage = Object.entries(profile.stages).find(
+      ([, value]) =>
+        args[0] === 'deployment' &&
+        args[1] === value.scope &&
+        args[args.indexOf('--name') + 1] === value.deploymentName,
+    );
+    if (writing) {
+      requirePilot(
+        stage && ['validate', 'what-if', 'create'].includes(args[2]),
+        'Target client has no VM/disk/delete/export/token or arbitrary write capability.',
+      );
+      const [key, value] = stage;
+      const prefix = [
+        'deployment',
+        value.scope,
+        args[2],
+        '--name',
+        value.deploymentName,
+        ...(value.scope === 'group'
+          ? [
+              '--resource-group',
+              profile.compute.resourceGroup,
+              '--mode',
+              'Incremental',
+            ]
+          : ['--location', profile.compute.location]),
+      ];
+      const template = args[args.indexOf('--template-file') + 1];
+      const parameters = args[args.indexOf('--parameters') + 1];
+      requirePilot(
+        new RegExp(
+          `^/proc/${process.pid}/fd/[0-9]+/${key}-template\\.json$`,
+        ).test(template ?? '') &&
+          parameters ===
+            '@' + template.replace('-template.json', '-parameters.json') &&
+          isDeepStrictEqual(args, [
+            ...prefix,
+            '--template-file',
+            template,
+            '--parameters',
+            parameters,
+            ...(args[2] === 'create'
+              ? ['--no-wait']
+              : [
+                  '--validation-level',
+                  'Provider',
+                  ...(args[2] === 'what-if'
+                    ? [
+                        '--result-format',
+                        'FullResourcePayloads',
+                        '--no-pretty-print',
+                      ]
+                    : []),
+                ]),
+          ]),
+        'Target request escaped its fixed stage, incremental mode, private request files or provider validation.',
+      );
+      return;
+    }
+    const reads = [
+      ['account', 'show'],
+      principalArgs,
+      ...['exists', 'show'].map((action) => [
+        'group',
+        action,
+        '--name',
+        profile.compute.resourceGroup,
+      ]),
+      ...[
+        profile.compute.resourceGroup,
+        profile.sourcePreservation.resourceGroup,
+      ].map((group) => [
+        'resource',
+        'list',
+        '--resource-group',
+        group,
+        '--query',
+        '[].{id:id,type:type,location:location,tags:tags}',
+      ]),
+      [
+        'vm',
+        'get-instance-view',
+        '--ids',
+        profile.sourcePreservation.vmId,
+        '--query',
+        'instanceView.statuses',
+      ],
+      ...[
+        profile.sourcePreservation.vmId,
+        profile.sourcePreservation.osDiskId,
+        profile.sourcePreservation.dataDiskId,
+        ...Object.values(profile.sourcePreservation.snapshots).map(
+          (item) => item.id,
+        ),
+      ].map((id) => [
+        'resource',
+        'show',
+        '--ids',
+        id,
+        '--api-version',
+        id === profile.sourcePreservation.vmId ? '2025-11-01' : '2025-01-02',
+      ]),
+      ...Object.values(profile.stages).flatMap((value) => [
+        [
+          'deployment',
+          value.scope,
+          'list',
+          ...(value.scope === 'group'
+            ? ['--resource-group', profile.compute.resourceGroup]
+            : []),
+          '--query',
+          `[?name=='${value.deploymentName}'].id`,
+        ],
+        [
+          'deployment',
+          value.scope,
+          'show',
+          '--name',
+          value.deploymentName,
+          ...(value.scope === 'group'
+            ? ['--resource-group', profile.compute.resourceGroup]
+            : []),
+        ],
+      ]),
+    ];
+    requirePilot(
+      reads.some((expected) => isDeepStrictEqual(args, expected)),
+      'Target client permits only fixed account/source/preservation GETs; no arbitrary read or mutation through read().',
+    );
+  };
+  const prepare = (
+    args,
+    options = {},
+    writing = false,
+    environment = process.env,
+  ) => {
+    if (profile === SCUS_PROFILE) {
+      requirePilot(
+        Array.isArray(args) && args.every((arg) => typeof arg === 'string'),
+        'Target command arguments must be an exact string array.',
+      );
+      requirePilot(
+        options &&
+          typeof options === 'object' &&
+          !Array.isArray(options) &&
+          Reflect.ownKeys(options).every((key) =>
+            ['signal', 'timeoutMs'].includes(key),
+          ),
+        'Target command options are limited to signal and timeoutMs.',
+      );
+    }
+    args = Object.freeze([...args]);
+    const { signal, timeoutMs = 20 * 60_000 } = options;
+    const env = Object.freeze({
+      ...environment,
+      AZURE_CORE_COLLECT_TELEMETRY: 'no',
+    });
+    if (profile === SCUS_PROFILE) {
+      requirePilot(
+        (signal === undefined || signal instanceof AbortSignal) &&
+          Number.isInteger(timeoutMs) &&
+          timeoutMs >= 0 &&
+          timeoutMs <= 2_147_483_647,
+        'Target command signal or timeout is invalid.',
+      );
+      assertProfileEnvironment(profile, env);
+    }
+    allowed(args, writing);
     requirePilot(
       !args.some((arg) =>
         ['--subscription', '--debug', '--verbose', '--output'].includes(arg),
       ),
       'Pilot commands cannot override scope or enable logging.',
     );
+    return Object.freeze({
+      args: Object.freeze([
+        ...args,
+        '--subscription',
+        SCOPE.subscriptionId,
+        '--only-show-errors',
+        '--output',
+        'json',
+      ]),
+      options: Object.freeze({
+        timeout: timeoutMs,
+        signal,
+        maxBuffer: 8 * 1024 * 1024,
+        env,
+      }),
+    });
+  };
+  const invoke = async ({ args, options }) => {
     try {
-      const { stdout } = await run(
-        'az',
-        [
-          ...args,
-          '--subscription',
-          SCOPE.subscriptionId,
-          '--only-show-errors',
-          '--output',
-          'json',
-        ],
-        {
-          timeout: timeoutMs,
-          signal,
-          maxBuffer: 8 * 1024 * 1024,
-          env: { ...process.env, AZURE_CORE_COLLECT_TELEMETRY: 'no' },
-        },
-      );
+      const { stdout } = await run('az', args, options);
       return stdout.trim() ? JSON.parse(stdout) : undefined;
     } catch {
       throw new PilotError(
@@ -60,32 +262,60 @@ export function createAz(run = execute) {
       );
     }
   };
+  const read = async (args, options) => invoke(prepare(args, options));
   const verify = async (options) => {
     const account = await read(['account', 'show'], options);
-    const principal = await read(
-      [
-        'rest',
-        '--method',
-        'get',
-        '--url',
-        'https://graph.microsoft.com/v1.0/me?$select=id',
-        '--resource',
-        'https://graph.microsoft.com/',
-        '--query',
-        'id',
-      ],
-      options,
-    );
+    const principal = await read(principalArgs, options);
     assertAccount(account, principal);
   };
-  return {
+  const verifyPrepared = async ({ options }) => {
+    const authOptions = { signal: options.signal, timeoutMs: options.timeout };
+    const account = prepare(
+      ['account', 'show'],
+      authOptions,
+      false,
+      options.env,
+    );
+    const principal = prepare(principalArgs, authOptions, false, options.env);
+    assertAccount(await invoke(account), await invoke(principal));
+  };
+  const client = {
     read,
     verify,
-    write: async (args) => {
-      await verify();
-      return read(args);
+    write: async (args, options) => {
+      if (profile === ORIGINAL_PROFILE) {
+        await verify(options);
+        return read(args, options);
+      }
+      const invocation = prepare(args, options, true);
+      requirePilot(
+        invocation.args[2] !== 'create',
+        'Target create requires the internal durable-intent callback; write() permits only validate/what-if.',
+      );
+      await verifyPrepared(invocation);
+      return invoke(invocation);
     },
   };
+  if (profile === SCUS_PROFILE)
+    client.createWithIntent = async (args, persistIntent, options) => {
+      requirePilot(
+        typeof persistIntent === 'function',
+        'Target create requires an internal durable-intent callback.',
+      );
+      const invocation = prepare(args, options, true);
+      requirePilot(
+        invocation.args[2] === 'create',
+        'The intent callback is only for the exact stage CREATE.',
+      );
+      await verifyPrepared(invocation);
+      await persistIntent();
+      return invoke(invocation); // No authentication or mutable request preparation after durable intent.
+    };
+  Object.defineProperty(client, 'profile', {
+    value: profile,
+    enumerable: true,
+  });
+  return client;
 }
 
 export async function inspectGroupBeforeDeployment(az, state) {

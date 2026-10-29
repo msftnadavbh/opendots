@@ -41,6 +41,8 @@ import { backupHttps } from './backup-https.mjs';
 import { readPrivate, writePrivate } from './runtime-env.mjs';
 import { stageBuild } from './build-context.mjs';
 import { manifest, verifyRestore } from './sqlite-backup.mjs';
+import { ORIGINAL_PROFILE, selectProfile } from './profiles.mjs';
+import { migrationMain } from './migration.mjs';
 
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const artifacts = join(root, 'artifacts/azure-pilot');
@@ -55,6 +57,10 @@ const jsonFile = async (path, optional = false) => {
 };
 
 export async function main(args = process.argv.slice(2)) {
+  const selected = selectProfile(args);
+  if (selected.profile !== ORIGINAL_PROFILE)
+    return migrationMain(selected.profile, selected.args);
+  args = selected.args;
   const [command, ...parameters] = args;
   const arity = {
     prepare: 1,
