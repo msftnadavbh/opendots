@@ -1,0 +1,80 @@
+{
+  "networkSecurityGroups": {
+    "securityRules": [
+      {
+        "name": "deny-other-inbound",
+        "properties": {
+          "access": "Deny",
+          "destinationAddressPrefix": "*",
+          "destinationPortRange": "*",
+          "direction": "Inbound",
+          "priority": 4096,
+          "protocol": "*",
+          "sourceAddressPrefix": "*",
+          "sourcePortRange": "*"
+        }
+      },
+      {
+        "name": "https-and-acme",
+        "properties": {
+          "access": "Allow",
+          "destinationAddressPrefix": "10.43.0.4/32",
+          "destinationPortRanges": ["80", "443"],
+          "direction": "Inbound",
+          "priority": 100,
+          "protocol": "Tcp",
+          "sourceAddressPrefix": "Internet",
+          "sourcePortRange": "*"
+        }
+      }
+    ]
+  },
+  "networkInterfaces": {
+    "ipConfigurations": [
+      {
+        "name": "primary",
+        "properties": {
+          "privateIPAddress": "10.43.0.4",
+          "privateIPAddressVersion": "IPv4",
+          "privateIPAllocationMethod": "Static",
+          "publicIPAddress": {
+            "id": "/subscriptions/68eab0d1-ab81-4851-b2dd-173dede87582/resourceGroups/rg-opendots-pilot-scus/providers/Microsoft.Network/publicIPAddresses/pip-opendots-pilot-scus",
+            "resourceGroup": "rg-opendots-pilot-scus"
+          },
+          "subnet": {
+            "id": "/subscriptions/68eab0d1-ab81-4851-b2dd-173dede87582/resourceGroups/rg-opendots-pilot-scus/providers/Microsoft.Network/virtualNetworks/vnet-opendots-pilot-scus/subnets/app",
+            "resourceGroup": "rg-opendots-pilot-scus"
+          }
+        }
+      }
+    ]
+  },
+  "virtualMachines": {
+    "storageProfile": {
+      "dataDisks": [
+        {
+          "caching": "None",
+          "createOption": "Attach",
+          "deleteOption": "Detach",
+          "lun": 0,
+          "name": "disk-opendots-pilot-scus-data"
+        }
+      ],
+      "diskControllerType": "NVMe",
+      "imageReference": {
+        "offer": "ubuntu-24_04-lts",
+        "publisher": "Canonical",
+        "sku": "server",
+        "version": "24.04.202610160"
+      },
+      "osDisk": {
+        "caching": "ReadWrite",
+        "createOption": "FromImage",
+        "deleteOption": "Detach",
+        "diskSizeGB": 32,
+        "name": "disk-opendots-pilot-scus-os"
+      }
+    },
+    "publicKeys": [{ "keyData": "*******", "path": "*******" }]
+  }
+}

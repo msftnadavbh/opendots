@@ -265,6 +265,24 @@ Verified provider values are pinned at `stages.host.binding.network.resources.pi
 never filled, and later classification drift stops without rebinding or corrective writes. Other network
 resources still reject IP tags; ownership tags and all DNS/routing/prefix/peering/attachment guards are unchanged.
 
+Host **what-if only** accepts four bounded preview representations observed in a diagnostic response:
+the two exact NSG rules in either name order (all security properties remain exact); omission of the sole NIC
+IP configuration's whole `primary` property (a present value must be `true`); independent omission of the VM's
+whole OS/data `managedDisk` properties; and exactly one SSH public-key entry containing either the exact intended
+path/key pair or both values literally `*******` (seven asterisks). A present managed-disk object must retain
+its requested fields; any returned ID/SKU must match the exact target disk/`Standard_LRS`, with no other
+managed-disk configuration. Null, partial, contradictory or unresolved fields and mixed/other masks fail.
+No other array order or masking allowance is introduced. Overlay/classification and no-guest-execution guards
+inspect the original payload, and neither provider nor expected inputs are rewritten.
+
+Omitted or masked preview values are **not verified equal**. Manual review must inspect the exact compiled host
+graph, prepared public parameters/key binding and Provider-level validation as well as the full raw what-if,
+explicitly recognizing these preview gaps. Completed VM/NIC GETs still require actual managed-disk IDs,
+`primary:true` and the intended unmasked SSH path/key; dedicated disk size/SKU checks are unchanged. The diagnostic
+capture is regression evidence only, not an accepted validation proof or a universal provider-shape guarantee.
+After source review, the lead must rerun normal `validate host` and independently review its fresh proposal;
+no diagnostic is promoted, no intent/create is authorized by this compatibility change alone.
+
 The image is exactly `Canonical:ubuntu-24_04-lts:server:24.04.202610160` in South Central US. Preflight checks its
 documented Linux/x64/V2 identity and Trusted Launch/NVMe compatibility. The marketplace GET schema does not
 establish a minimum disk size. The template explicitly requests a32GiB FromImage OS disk; real Provider validation

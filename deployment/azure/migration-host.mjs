@@ -461,12 +461,79 @@ function noNetworkOverlays(value, profile) {
     )
   );
 }
+// What-if omissions/redaction are not verified values; completed GETs still use strict matches().
+function hostPreviewMatches(actual, spec, profile) {
+  const wanted = structuredClone(spec.properties);
+  const { network: n, disks: d, vm } = profile.compute;
+  if (sameId(spec.id, n.nsg.id) && spec.type === n.nsg.type) {
+    const rules = actual?.securityRules;
+    if (!Array.isArray(rules) || rules.length !== wanted.securityRules.length)
+      return false;
+    for (const rule of wanted.securityRules) {
+      const found = rules.filter((r) => r?.name === rule.name);
+      if (
+        found.length !== 1 ||
+        !isDeepStrictEqual(found[0].properties, rule.properties)
+      )
+        return false;
+    }
+    delete wanted.securityRules;
+  }
+  if (sameId(spec.id, n.nic.id) && spec.type === n.nic.type) {
+    const p = actual?.ipConfigurations?.[0]?.properties;
+    if (p && !Object.hasOwn(p, 'primary'))
+      delete wanted.ipConfigurations[0].properties.primary;
+  }
+  if (sameId(spec.id, vm.id) && spec.type === vm.type) {
+    for (const [disk, expected, id] of [
+      [actual?.storageProfile?.osDisk, wanted.storageProfile.osDisk, d.os.id],
+      [
+        actual?.storageProfile?.dataDisks?.[0],
+        wanted.storageProfile.dataDisks[0],
+        d.data.id,
+      ],
+    ]) {
+      if (!disk || typeof disk !== 'object' || Array.isArray(disk))
+        return false;
+      if (!Object.hasOwn(disk, 'managedDisk')) delete expected.managedDisk;
+      else {
+        const managed = disk.managedDisk;
+        if (
+          !managed ||
+          typeof managed !== 'object' ||
+          Array.isArray(managed) ||
+          !Object.keys(managed).every((key) =>
+            ['id', 'storageAccountType'].includes(key),
+          ) ||
+          !matches(managed, expected.managedDisk) ||
+          (Object.hasOwn(managed, 'id') && !sameId(managed.id, id)) ||
+          (Object.hasOwn(managed, 'storageAccountType') &&
+            managed.storageAccountType !== 'Standard_LRS')
+        )
+          return false;
+      }
+    }
+    const keys = actual?.osProfile?.linuxConfiguration?.ssh?.publicKeys;
+    if (
+      !isDeepStrictEqual(
+        keys,
+        wanted.osProfile.linuxConfiguration.ssh.publicKeys,
+      ) &&
+      !isDeepStrictEqual(keys, [{ path: '*******', keyData: '*******' }])
+    )
+      return false;
+    delete wanted.osProfile.linuxConfiguration.ssh.publicKeys;
+  }
+  return matches(actual, wanted);
+}
 export function assertHostWhatIf(after, spec, profile, stage) {
   requirePilot(
     sameId(after.id ?? spec.id, spec.id) &&
       after.type?.toLowerCase() === spec.type.toLowerCase() &&
       (after.name == null || after.name === spec.name) &&
-      matches(after.properties, spec.properties) &&
+      (stage === 'host'
+        ? hostPreviewMatches(after.properties, spec, profile)
+        : matches(after.properties, spec.properties)) &&
       (stage === 'model-role'
         ? !after.properties.condition &&
           !after.properties.conditionVersion &&
